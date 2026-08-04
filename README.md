@@ -5,8 +5,8 @@ your session and weekly quota is gone, how much you have written, and a
 contribution-style heatmap of your activity — with Clawd, the Claude Code
 mascot, wandering around at the bottom.
 
-Bilingual (English / Hebrew, with proper RTL), GTK3, no dependencies beyond
-what a normal desktop already has.
+GTK3, a single self-contained file, no dependencies beyond what a normal
+desktop already has.
 
 ```text
 ✳ Claude Code — Usage                        ⟳  🗕  עב  ✕
@@ -72,7 +72,7 @@ cp claude-stats-widget ~/.local/bin/ && chmod +x ~/.local/bin/claude-stats-widge
 
 | Action | How |
 |---|---|
-| Switch language (EN / עברית) | `עב` / `EN` button — layout flips to RTL |
+| Switch to Hebrew and back | `עב` / `EN` button (see below) |
 | Shrink to a corner cube | `🗕` button, `⤢` to expand again |
 | Refresh now | `⟳` button |
 | Move the window | Drag it (on Wayland: `Super` + drag) |
@@ -85,6 +85,21 @@ between runs.
 Desktop notifications fire at 80% and 95% of a quota, and again when it is
 spent. They only ever fire on the real number from `/usage` — never on an
 estimate.
+
+## Hebrew, as a bonus
+
+The interface is English by default. It also ships a complete Hebrew
+translation: press `עב` and the whole widget switches, including a genuine
+right-to-left layout — labels, tiles, alignment and notifications all flip. The
+activity heatmap deliberately stays left-to-right in both languages, because it
+is a timeline and reads chronologically either way.
+
+Hebrew is selected automatically only if your desktop locale is already Hebrew
+(`LANG=he_*`); otherwise English is the default. Your choice is remembered.
+
+Adding another language is a matter of copying the `TR["en"]` block in the
+source and translating the strings; nothing else is language-aware except the
+text-direction switch.
 
 ## Clawd
 

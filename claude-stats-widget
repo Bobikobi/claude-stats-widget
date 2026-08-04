@@ -261,6 +261,14 @@ def clawd_svg(grid, cell):
 
 # ------------------------------------------------------------------ config
 
+def default_lang():
+    """English by default; Hebrew only if the desktop itself runs in Hebrew."""
+    for var in ("LC_ALL", "LC_MESSAGES", "LANG"):
+        if (os.environ.get(var) or "").lower().startswith("he"):
+            return "he"
+    return "en"
+
+
 def load_config():
     try:
         with open(CONFIG_PATH, encoding="utf-8") as fh:
@@ -650,7 +658,7 @@ def run_gui():
             self.set_keep_above(True)  # honored on X11; no-op on Wayland
             self.stats = {}
             self.config = load_config()
-            self.lang = self.config.get("lang", "he")
+            self.lang = self.config.get("lang", default_lang())
             self.mode = self.config.get("mode", "expanded")
             self.apply_direction()
 
