@@ -1,0 +1,1263 @@
+#!/usr/bin/env python3
+"""Claude Code usage widget — reads ~/.claude/projects/**/*.jsonl and shows
+usage stats in a small always-available desktop window (GTK3).
+
+Modes: expanded (full stats + walking Clawd) and mini (small cube with
+remaining-budget meters + Clawd in the corner).
+
+CLI: --json prints the computed stats and exits (for testing/scripting).
+"""
+import json
+import os
+import random
+import re
+import subprocess
+import threading
+import sys
+import time
+from collections import Counter
+from datetime import date, datetime, timedelta
+from pathlib import Path
+
+SCRIPT_PATH = Path(__file__).resolve()
+ICON_PATH = Path.home() / ".local" / "share" / "icons" / "claude-clawd.png"
+PROJECTS_DIR = Path.home() / ".claude" / "projects"
+CONFIG_PATH = Path.home() / ".config" / "claude-stats-widget.json"
+REFRESH_SECONDS = 30
+WATCH_SECONDS = 5      # live-session / self-update poll
+ACTIVE_WINDOW = 90     # a transcript touched this recently means "in a session"
+HEATMAP_WEEKS = 19      # weeks across, matching the app's own grid
+# Pride and Prejudice ≈ 122k words ≈ 162.5k tokens — the app's own yardstick
+HP_TOKENS = 162_500
+MODEL_NAMES = {
+    "claude-fable-5": "Fable 5",
+    "claude-opus-5": "Opus 5",
+    "claude-sonnet-5": "Sonnet 5",
+    "claude-haiku-4-5": "Haiku 4.5",
+}
+
+TR = {
+    "he": {
+        "title": "✳ Claude Code — שימוש",
+        "sessions": "סשנים",
+        "messages": "הודעות",
+        "total_tokens": "סה״כ טוקנים",
+        "active_days": "ימים פעילים",
+        "current_streak": "רצף נוכחי",
+        "longest_streak": "רצף שיא",
+        "peak_hour": "שעת שיא",
+        "favorite_model": "מודל מועדף",
+        "toggle": "EN",
+        "hp_low": "עוד לא הגעת לפרק הראשון של 'גאווה ודעה קדומה'.",
+        "hp": "השתמשת בפי ~{r:.0f} טוקנים מ'גאווה ודעה קדומה'.",
+        "err": "שגיאה בקריאת נתונים: {e}",
+        "alert_title_hour5": "ניצלת {pct:.0f}% ממכסת 5 השעות",
+        "alert_title_week": "ניצלת {pct:.0f}% מהמכסה השבועית",
+        "alert_done": "המכסה נגמרה. צריך לחכות לאיפוס.",
+        "alert_reset": "מתאפס {reset}.",
+        "hour5_reset": "5 שעות · הסשן",
+        "tip_session": "100% = הסשן נגמר והמכסה נפתחת מחדש. נותרו {left}.\nזו התקדמות בזמן, לא ניצול מכסה — הרץ /usage למספר האמיתי.",
+        "hour5_quota": "סשן · ניצול מכסה",
+        "week_quota": "שבוע · ניצול מכסה",
+        "tip_quota": "מכסה אמיתית מהשרת. 100% = חסימה.\nמתאפס {reset} · נבדק לפני {age} דקות.",
+        "week_reset": "7 ימים · מתאפס בעוד",
+        "fresh": "נגמר",
+        "tip_countdown": "הזמן שנותר עד שחלון השימוש נפתח מחדש.",
+        "hour5_short": "5 שעות",
+        "week_short": "7 ימים",
+    },
+    "en": {
+        "title": "✳ Claude Code — Usage",
+        "sessions": "Sessions",
+        "messages": "Messages",
+        "total_tokens": "Total tokens",
+        "active_days": "Active days",
+        "current_streak": "Current streak",
+        "longest_streak": "Longest streak",
+        "peak_hour": "Peak hour",
+        "favorite_model": "Favorite model",
+        "toggle": "עב",
+        "hp_low": "You haven't reached chapter one of Pride and Prejudice yet.",
+        "hp": "You've used ~{r:.0f}× more tokens than Pride and Prejudice.",
+        "err": "Error reading data: {e}",
+        "alert_title_hour5": "You've used {pct:.0f}% of your 5-hour quota",
+        "alert_title_week": "You've used {pct:.0f}% of your weekly quota",
+        "alert_done": "Quota spent. You'll have to wait for the reset.",
+        "alert_reset": "Resets {reset}.",
+        "hour5_reset": "5h session",
+        "tip_session": "100% = session over, quota reopens. {left} left.\nThis is time progress, not quota use - run /usage for the real number.",
+        "hour5_quota": "Session quota used",
+        "week_quota": "Week quota used",
+        "tip_quota": "Real quota from the server. 100% = blocked.\nResets {reset} · checked {age} min ago.",
+        "week_reset": "7d resets in",
+        "fresh": "done",
+        "tip_countdown": "Time left until this usage window opens up again.",
+        "hour5_short": "5h",
+        "week_short": "7d",
+    },
+}
+
+STAT_KEYS = [
+    "sessions", "messages", "total_tokens", "active_days",
+    "current_streak", "longest_streak", "peak_hour", "favorite_model",
+]
+
+# ------------------------------------------------------------------- Clawd
+# Anthropic's Claude Code mascot, hand-pixelled: coral blob, two black eyes.
+# Chars: . transparent | O coral | B eye | D closed-eye line | Z zzz
+CLAWD_BODY = [
+    "....OOOOOO....",
+    "..OOOOOOOOOO..",
+    ".OOOOOOOOOOOO.",
+    ".OOOOOOOOOOOO.",
+    ".OOOOOOOOOOOO.",
+    "OOOOOOOOOOOOOO",
+    "OOOOOOOOOOOOOO",
+    ".OOOOOOOOOOOO.",
+]
+FEET = {
+    "idle":  ["...OO....OO...", "...OO....OO..."],
+    "walk1": ["..OO....OO....", "..OO....OO...."],
+    "walk2": ["....OO....OO..", "....OO....OO.."],
+    "spread": [".OO........OO.", "OO..........OO"],
+    "tuck":  ["...OO....OO...", ".............."],
+}
+CLAWD_COLORS = {
+    "O": "#D97757", "B": "#141413", "D": "#8a4a32", "Z": "#9c9a94",
+    "P": "#8a8780", "F": "#e88a6a", "L": "#4a4a47", "S": "#5b8dd9",
+    "T": "#8fb8f0",  # lit screen
+    "1": "#D97757", "2": "#6fbf73", "3": "#e8a34c", "4": "#4f78ff",
+}
+# first column of each 2x2 eye, per gaze direction
+EYE_POS = {"open": (3, 9), "left": (2, 8), "right": (4, 10)}
+
+# canvas is wider than the body so arms, flag, laptop and confetti fit
+CANVAS_W, CANVAS_H = 22, 13
+BODY_X, BODY_Y = 4, 3
+ARM_L, ARM_R = BODY_X - 1, BODY_X + 14      # columns 3 and 18
+ARM_ROWS = {"up": (BODY_Y + 1, BODY_Y + 2), "mid": (BODY_Y + 3, BODY_Y + 4)}
+
+CONFETTI_PHASES = 10
+
+
+def _build_confetti():
+    """Deterministic particle burst so frames stay cacheable."""
+    rng = random.Random(7)
+    seeds = []
+    for _ in range(14):
+        seeds.append((
+            11 + rng.uniform(-2, 2), 4.0,          # start x, y
+            rng.uniform(-1.1, 1.1), rng.uniform(-1.4, -0.5),  # vx, vy
+            rng.choice("1234"),
+        ))
+    phases = []
+    for p in range(CONFETTI_PHASES):
+        cells = []
+        for x0, y0, vx, vy, col in seeds:
+            x = x0 + vx * p
+            y = y0 + vy * p + 0.16 * p * p
+            xi, yi = int(round(x)), int(round(y))
+            if 0 <= xi < CANVAS_W and 0 <= yi < CANVAS_H and p < 9:
+                cells.append((xi, yi, col))
+        phases.append(cells)
+    return phases
+
+
+CONFETTI = _build_confetti()
+
+
+def clawd_grid(feet="idle", eyes="open", arms=None, zzz=0, flag=0,
+               laptop=0, confetti=-1):
+    canvas = [["."] * CANVAS_W for _ in range(CANVAS_H)]
+
+    body = [list(r) for r in CLAWD_BODY]
+    if eyes == "closed":
+        for c in (3, 4, 9, 10):
+            body[4][c] = "D"
+    elif eyes == "sad":
+        for c in (3, 4, 9, 10):
+            body[3][c] = "D"   # drooping lid
+            body[4][c] = "B"
+    else:
+        lc, rc = EYE_POS[eyes]
+        for r in (3, 4):
+            for c in (lc, lc + 1, rc, rc + 1):
+                body[r][c] = "B"
+
+    for y, row in enumerate(body + [list(r) for r in FEET[feet]]):
+        for x, ch in enumerate(row):
+            if ch != ".":
+                canvas[BODY_Y + y][BODY_X + x] = ch
+
+    if arms:
+        which = "both" if arms.startswith("both") else "right"
+        pose = "up" if arms.endswith("up") else "mid"
+        r1, r2 = ARM_ROWS[pose]
+        cols = [ARM_R] + ([ARM_L] if which == "both" else [])
+        for c in cols:
+            canvas[r1][c] = canvas[r2][c] = "O"
+
+    if flag:
+        for r in range(1, ARM_ROWS["up"][0] + 1):
+            canvas[r][ARM_R + 1] = "P"          # pole
+        cloth_top = 1 if flag == 1 else 2       # two-frame wave
+        for r in (cloth_top, cloth_top + 1):
+            canvas[r][ARM_R + 2] = "F"
+            canvas[r][ARM_R + 3] = "F"
+
+    if laptop:
+        screen = "T" if laptop == 2 else "S"
+        for r in range(8, 11):
+            for c in range(ARM_R, ARM_R + 3):
+                canvas[r][c] = screen
+        for c in range(ARM_R - 1, ARM_R + 4):
+            canvas[11][c] = "L"
+
+    if zzz >= 1:
+        canvas[2][BODY_X + 12] = "Z"
+    if zzz >= 2:
+        canvas[1][BODY_X + 13] = "Z"
+
+    if confetti >= 0:
+        for x, y, col in CONFETTI[min(confetti, CONFETTI_PHASES - 1)]:
+            if canvas[y][x] == ".":   # never punch holes in Clawd himself
+                canvas[y][x] = col
+
+    return ["".join(r) for r in canvas]
+
+
+def write_icon():
+    """Render Clawd to a PNG for the launcher and notifications."""
+    try:
+        import gi
+        gi.require_version("GdkPixbuf", "2.0")
+        from gi.repository import GdkPixbuf
+        ICON_PATH.parent.mkdir(parents=True, exist_ok=True)
+        grid = clawd_grid("idle", "open")
+        # trim the empty margin so the face fills the icon
+        grid = [row[3:19] for row in grid[3:]]
+        loader = GdkPixbuf.PixbufLoader.new_with_type("svg")
+        loader.write(clawd_svg(grid, 16))       # 256x160 source
+        loader.close()
+        loader.get_pixbuf().savev(str(ICON_PATH), "png", [], [])
+        return True
+    except Exception:
+        return False    # a missing icon must never stop the widget
+
+
+def clawd_svg(grid, cell):
+    w, h = len(grid[0]) * cell, len(grid) * cell
+    parts = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" '
+             f'shape-rendering="crispEdges">']
+    for y, row in enumerate(grid):
+        for x, ch in enumerate(row):
+            color = CLAWD_COLORS.get(ch)
+            if color:
+                parts.append(f'<rect x="{x * cell}" y="{y * cell}" '
+                             f'width="{cell}" height="{cell}" fill="{color}"/>')
+    parts.append("</svg>")
+    return "".join(parts).encode()
+
+
+# ------------------------------------------------------------------ config
+
+def load_config():
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_config(cfg):
+    try:
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(CONFIG_PATH, "w", encoding="utf-8") as fh:
+            json.dump(cfg, fh, ensure_ascii=False)
+    except OSError:
+        pass
+
+
+def update_config(**changes):
+    """Merge onto what is on disk right now.
+
+    Writing a whole in-memory dict would clobber keys another process wrote
+    meanwhile — that is exactly how a calibration got lost once.
+    """
+    cfg = load_config()
+    cfg.update(changes)
+    save_config(cfg)
+    return cfg
+
+
+def newest_transcript_mtime():
+    newest = 0.0
+    for jf in PROJECTS_DIR.glob("*/*.jsonl"):
+        try:
+            newest = max(newest, jf.stat().st_mtime)
+        except OSError:
+            continue
+    return newest
+
+
+def script_mtime():
+    try:
+        return SCRIPT_PATH.stat().st_mtime
+    except OSError:
+        return None
+
+
+# ------------------------------------------------------------------- stats
+
+def pretty_model(model_id):
+    if not model_id:
+        return "—"
+    for key, name in MODEL_NAMES.items():
+        if model_id.startswith(key):
+            return name
+    parts = model_id.replace("claude-", "").split("-")
+    return " ".join(p.capitalize() for p in parts)
+
+
+def fmt_num(n):
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}k"
+    return str(n)
+
+
+USAGE_CACHE = Path.home() / ".cache" / "claude-stats-widget-usage.json"
+USAGE_POLL_SECONDS = 300      # /usage is answered locally and costs nothing
+SESSION_RE = re.compile(r"Current session:\s*(\d+)%\s*used[^\n]*?resets\s*([^(\n]+)")
+WEEK_RE = re.compile(r"Current week[^:\n]*:\s*(\d+)%\s*used[^\n]*?resets\s*([^(\n]+)")
+
+
+def parse_usage(text):
+    """Pull the real percentages out of what `/usage` prints."""
+    out = {"at": time.time()}
+    m = SESSION_RE.search(text)
+    if m:
+        out["session_pct"] = int(m.group(1))
+        out["session_reset"] = m.group(2).strip()
+    m = WEEK_RE.search(text)
+    if m:
+        out["week_pct"] = int(m.group(1))
+        out["week_reset"] = m.group(2).strip()
+    return out if "session_pct" in out or "week_pct" in out else None
+
+
+def poll_usage():
+    """Ask Claude Code itself for the quota.
+
+    Verified free: `/usage` is handled client-side, so the call reports
+    num_turns 0 and total_cost_usd 0. Runs headless, no window.
+    """
+    try:
+        proc = subprocess.run(
+            ["claude", "-p", "/usage", "--output-format", "json"],
+            capture_output=True, text=True, timeout=90)
+        data = json.loads(proc.stdout)
+    except Exception:
+        return None
+    report = parse_usage(data.get("result") or "")
+    if report:
+        try:
+            USAGE_CACHE.parent.mkdir(parents=True, exist_ok=True)
+            USAGE_CACHE.write_text(json.dumps(report), encoding="utf-8")
+        except OSError:
+            pass
+    return report
+
+
+def load_usage_cache():
+    try:
+        return json.loads(USAGE_CACHE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def week_start(today):
+    """Sunday-based week, matching the heatmap's column layout."""
+    return today - timedelta(days=(today.weekday() + 1) % 7)
+
+
+def block_reset(timeline, seconds, now_ts):
+    """When the current usage window rolls over.
+
+    Claude's windows are not rolling averages: one opens with your first
+    message and closes `seconds` later. Walk the timeline and keep the last
+    block that is still open.
+    """
+    start = None
+    for ts, _ in timeline:
+        if start is None or ts >= start + seconds:
+            start = ts
+    if start is None:
+        return None
+    reset = start + seconds
+    return reset if reset > now_ts else None
+
+
+def collect_stats():
+    sessions = set()
+    raw_messages = 0      # every user/assistant entry, exactly as the app counts
+    raw_tokens = 0        # summed over every assistant entry, duplicates included
+    user_msgs = 0
+    assistant_seen = {}  # message id -> (tokens, model, when)
+    day_activity = Counter()
+    hour_counter = Counter()
+    model_counter = Counter()
+
+    for jf in PROJECTS_DIR.glob("*/*.jsonl"):
+        try:
+            with open(jf, encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    try:
+                        obj = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    typ = obj.get("type")
+                    if typ not in ("user", "assistant"):
+                        continue
+                    raw_messages += 1
+                    if typ == "assistant":
+                        _u = (obj.get("message") or {}).get("usage") or {}
+                        raw_tokens += (_u.get("input_tokens", 0) or 0) + \
+                                      (_u.get("output_tokens", 0) or 0)
+                    if obj.get("isMeta"):
+                        continue
+                    ts = obj.get("timestamp")
+                    try:
+                        when = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone()
+                    except (AttributeError, ValueError):
+                        continue
+                    msg = obj.get("message") or {}
+
+                    if typ == "user":
+                        content = msg.get("content")
+                        # skip tool results and local-command wrappers
+                        if isinstance(content, list):
+                            if any(isinstance(c, dict) and c.get("type") == "tool_result" for c in content):
+                                continue
+                            content = " ".join(
+                                c.get("text", "") for c in content if isinstance(c, dict)
+                            )
+                        if not isinstance(content, str) or content.lstrip().startswith("<"):
+                            continue
+                        user_msgs += 1
+                        sid = obj.get("sessionId")
+                        if sid:
+                            sessions.add(sid)
+                        day_activity[when.date()] += 1
+                        hour_counter[when.hour] += 1
+                    else:
+                        mid = msg.get("id")
+                        usage = msg.get("usage") or {}
+                        # matches the app's "Total tokens": input + output,
+                        # cache reads/writes excluded
+                        tokens = (
+                            usage.get("input_tokens", 0)
+                            + usage.get("output_tokens", 0)
+                        )
+                        model = msg.get("model")
+                        if mid:
+                            # streaming writes the same message id repeatedly;
+                            # keep the largest usage snapshot
+                            prev = assistant_seen.get(mid)
+                            if prev is None or tokens > prev[0]:
+                                assistant_seen[mid] = (tokens, model, when)
+                        else:
+                            assistant_seen[f"{jf.name}:{when.timestamp()}"] = (
+                                tokens, model, when)
+        except OSError:
+            continue
+
+    total_tokens = 0
+    assistant_msgs = 0
+    timeline = []  # message timestamps, for locating window boundaries
+    for tokens, model, when in assistant_seen.values():
+        total_tokens += tokens
+        assistant_msgs += 1
+        if model:
+            model_counter[model] += 1
+        timeline.append((when.timestamp(), 0.0))
+        day_activity[when.date()] += 0  # ensure day exists even w/o user msg
+    timeline.sort()
+
+    active_days = sorted(d for d, c in day_activity.items() if c > 0)
+
+    # streaks
+    current_streak = 0
+    today = date.today()
+    d = today
+    active_set = set(active_days)
+    if today not in active_set and (today - timedelta(days=1)) in active_set:
+        d = today - timedelta(days=1)
+    while d in active_set:
+        current_streak += 1
+        d -= timedelta(days=1)
+
+    longest_streak = 0
+    run = 0
+    prev = None
+    for d in active_days:
+        run = run + 1 if prev is not None and (d - prev).days == 1 else 1
+        longest_streak = max(longest_streak, run)
+        prev = d
+
+    peak_hour = hour_counter.most_common(1)[0][0] if hour_counter else None
+    fav_model = model_counter.most_common(1)[0][0] if model_counter else None
+
+    now_ts = datetime.now().astimezone().timestamp()
+    report = load_usage_cache()
+    windows = {}
+    for key, seconds in (("5h", 5 * 3600), ("7d", 7 * 86400)):
+        windows[key] = {
+            "window_seconds": seconds,
+            # fallback only: when the real quota is unavailable, show how far
+            # the current window has run
+            "resets_at": block_reset(timeline, seconds, now_ts),
+            # the real thing, straight from the server via `/usage`
+            "quota_pct": (report or {}).get(
+                "session_pct" if key == "5h" else "week_pct"),
+            "quota_reset": (report or {}).get(
+                "session_reset" if key == "5h" else "week_reset"),
+            "quota_age_min": (int((now_ts - report["at"]) / 60)
+                              if report else None),
+        }
+
+    return {
+        "window_5h": windows["5h"],
+        "window_7d": windows["7d"],
+        "sessions": len(sessions),
+        "messages": raw_messages,
+        "total_tokens": raw_tokens,
+        "unique_messages": user_msgs + assistant_msgs,
+        "deduped_tokens": total_tokens,
+        "active_days": len(active_days),
+        "current_streak": current_streak,
+        "longest_streak": longest_streak,
+        "peak_hour": peak_hour,
+        "favorite_model": pretty_model(fav_model),
+        "day_activity": {d.isoformat(): c for d, c in day_activity.items()},
+        "session_quota_pct": windows["5h"]["quota_pct"],
+        "week_quota_pct": windows["7d"]["quota_pct"],
+    }
+
+
+def fmt_countdown(seconds, lang):
+    """H:MM under a day, days+hours above it."""
+    if seconds >= 86400:
+        d, rem = divmod(seconds, 86400)
+        h = rem // 3600
+        return f"{d}d {h}h" if lang == "en" else f"{d}י {h}ש"
+    h, rem = divmod(seconds, 3600)
+    return f"{h}:{rem // 60:02d}"
+
+
+def fmt_hour(h):
+    if h is None:
+        return "—"
+    suffix = "AM" if h < 12 else "PM"
+    h12 = h % 12 or 12
+    return f"{h12} {suffix}"
+
+
+def hp_line(total, lang):
+    ratio = total / HP_TOKENS
+    if ratio < 0.1:
+        return TR[lang]["hp_low"]
+    return TR[lang]["hp"].format(r=ratio)
+
+
+# ---------------------------------------------------------------- GTK widget
+
+def run_gui():
+    import gi
+
+    gi.require_version("Gtk", "3.0")
+    gi.require_version("Gdk", "3.0")
+    from gi.repository import GLib, Gdk, GdkPixbuf, Gtk
+
+    CSS = b"""
+    window { background-color: #1a1a18; }
+    .card { background-color: #262624; border-radius: 12px; padding: 14px; }
+    .card-mini { background-color: #262624; border-radius: 12px; padding: 10px; }
+    .tile { background-color: #30302e; border-radius: 8px; padding: 8px 12px; }
+    .tile-label { color: #9c9a94; font-size: 11px; }
+    .tile-value { color: #f5f4ef; font-size: 19px; font-weight: bold; }
+    .title { color: #f5f4ef; font-size: 14px; font-weight: bold; }
+    .brand { color: #D97757; font-size: 15px; font-weight: bold; }
+    .footer { color: #9c9a94; font-size: 10px; }
+    .meter-label { color: #9c9a94; font-size: 10px; }
+    .meter-pct { color: #f5f4ef; font-size: 12px; font-weight: bold; }
+    .headerbtn { color: #9c9a94; background: none; border: none;
+                 box-shadow: none; padding: 0 6px; font-size: 12px; }
+    .headerbtn:hover { color: #f5f4ef; }
+    .h0 { background-color: #3c3c3a; border-radius: 2px; }
+    .h1 { background-color: #4a5a8c; border-radius: 2px; }
+    .h2 { background-color: #4568b8; border-radius: 2px; }
+    .h3 { background-color: #3d6bf2; border-radius: 2px; }
+    .h4 { background-color: #4f78ff; border-radius: 2px; }
+    levelbar trough { background-color: #3c3c3a; border-radius: 5px;
+                      min-height: 9px; border: none; }
+    levelbar block { border-radius: 5px; min-height: 9px; border: none; }
+    levelbar block.filled.calm { background-color: #6fbf73; }
+    levelbar block.filled.warn { background-color: #e8a34c; }
+    levelbar block.filled.crit { background-color: #e0645c; }
+    /* a record marker is not a limit, so never dress it up as danger */
+    levelbar.recordbar block.filled.calm,
+    levelbar.recordbar block.filled.warn,
+    levelbar.recordbar block.filled.crit { background-color: #5b7bb8; }
+    """
+
+    def make_pixbuf(grid, cell):
+        loader = GdkPixbuf.PixbufLoader.new_with_type("svg")
+        loader.write(clawd_svg(grid, cell))
+        loader.close()
+        return loader.get_pixbuf()
+
+    class FrameCache:
+        def __init__(self, cell):
+            self.cell = cell
+            self.cache = {}
+
+        def get(self, feet="idle", eyes="open", arms=None, zzz=0, flag=0,
+                laptop=0, confetti=-1, flip=False):
+            key = (feet, eyes, arms, zzz, flag, laptop, confetti, flip)
+            if key not in self.cache:
+                pb = make_pixbuf(
+                    clawd_grid(feet, eyes, arms, zzz, flag, laptop, confetti),
+                    self.cell)
+                self.cache[key] = pb.flip(True) if flip else pb
+            return self.cache[key]
+
+    JUMP_Y = [0, -3, -6, -8, -6, -3, 0, 0]
+
+    def make_meter():
+        bar = Gtk.LevelBar.new_for_interval(0, 100)
+        bar.set_hexpand(True)
+        bar.add_offset_value("calm", 50)   # 0-50%  green
+        bar.add_offset_value("warn", 80)   # 50-80% amber
+        bar.add_offset_value("crit", 100)  # 80-100% red
+        return bar
+
+    class Widget(Gtk.Window):
+        def __init__(self):
+            super().__init__(title="Claude Stats")
+            self.set_decorated(False)
+            self.set_keep_above(True)  # honored on X11; no-op on Wayland
+            self.stats = {}
+            self.config = load_config()
+            self.lang = self.config.get("lang", "he")
+            self.mode = self.config.get("mode", "expanded")
+            self.apply_direction()
+
+            provider = Gtk.CssProvider()
+            provider.load_from_data(CSS)
+            Gtk.StyleContext.add_provider_for_screen(
+                Gdk.Screen.get_default(), provider,
+                Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+            self.frames_big = FrameCache(5)    # 110x65 px
+            self.frames_mini = FrameCache(2)   # 44x26 px
+
+            self.stack = Gtk.Stack()
+            # each page keeps its own size — otherwise mini inherits the
+            # expanded page's dimensions and never shrinks to a cube
+            self.stack.set_hhomogeneous(False)
+            self.stack.set_vhomogeneous(False)
+            self.add(self.stack)
+            self.build_full()
+            self.build_mini()
+
+            self.connect("button-press-event", self.on_press)
+            self.connect("key-press-event", self.on_key)
+
+            # Clawd activity engine state
+            self.anim_x = 10.0
+            self.anim_dir = 1
+            self.anim_tick = 0
+            self.anim_blink = 0
+            self.act = ["walk", 60]
+            self.mini_tick = 0
+            self.mini_hop = 0
+            self.mini_wave = 0
+            self.polling = False
+            self.session_active = False
+            self.script_mtime = script_mtime()
+            self.last_seen_mtime = newest_transcript_mtime()
+            self.alerted = {}
+
+            self.apply_language()
+            self.refresh()
+            self.set_mode(self.mode, first=True)
+            GLib.timeout_add_seconds(REFRESH_SECONDS, self.refresh)
+            GLib.timeout_add(120, self.animate_big)
+            GLib.timeout_add(350, self.animate_mini)
+            GLib.timeout_add_seconds(WATCH_SECONDS, self.watch)
+            GLib.timeout_add_seconds(1, self.tick_countdown)
+            GLib.timeout_add_seconds(USAGE_POLL_SECONDS, self.spawn_usage_poll)
+            self.spawn_usage_poll()
+
+        # ---------------------------------------------------------- pages
+        def build_full(self):
+            outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+            outer.get_style_context().add_class("card")
+            for m in ("top", "bottom", "start", "end"):
+                getattr(outer, f"set_margin_{m}")(6)
+
+            header = Gtk.Box(spacing=6)
+            self.title_label = Gtk.Label()
+            self.title_label.get_style_context().add_class("title")
+            self.title_label.set_halign(Gtk.Align.START)
+            header.pack_start(self.title_label, True, True, 0)
+
+            self.lang_btn = Gtk.Button()
+            self.lang_btn.get_style_context().add_class("headerbtn")
+            self.lang_btn.set_relief(Gtk.ReliefStyle.NONE)
+            self.lang_btn.connect("clicked", self.on_toggle_lang)
+            header.pack_end(self.lang_btn, False, False, 0)
+
+            refresh_btn = Gtk.Button(label="\u27f3")
+            refresh_btn.get_style_context().add_class("headerbtn")
+            refresh_btn.set_relief(Gtk.ReliefStyle.NONE)
+            refresh_btn.set_tooltip_text("Refresh")
+            refresh_btn.connect("clicked", self.on_manual_refresh)
+            header.pack_end(refresh_btn, False, False, 0)
+
+            mini_btn = Gtk.Button(label="🗕")
+            mini_btn.get_style_context().add_class("headerbtn")
+            mini_btn.set_relief(Gtk.ReliefStyle.NONE)
+            mini_btn.connect("clicked", lambda *_: self.set_mode("mini"))
+            header.pack_end(mini_btn, False, False, 0)
+
+            close = Gtk.Button(label="✕")
+            close.get_style_context().add_class("headerbtn")
+            close.set_relief(Gtk.ReliefStyle.NONE)
+            close.connect("clicked", lambda *_: Gtk.main_quit())
+            header.pack_end(close, False, False, 0)
+            outer.pack_start(header, False, False, 0)
+
+            self.grid = Gtk.Grid(column_spacing=8, row_spacing=8)
+            self.grid.set_margin_top(10)
+            self.grid.set_column_homogeneous(True)
+            outer.pack_start(self.grid, False, False, 0)
+
+            self.tiles = {}
+            self.tile_labels = {}
+            for i, key in enumerate(STAT_KEYS):
+                box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+                box.get_style_context().add_class("tile")
+                lab = Gtk.Label()
+                lab.get_style_context().add_class("tile-label")
+                lab.set_halign(Gtk.Align.START)
+                val = Gtk.Label(label="…")
+                val.get_style_context().add_class("tile-value")
+                val.set_halign(Gtk.Align.START)
+                box.pack_start(lab, False, False, 0)
+                box.pack_start(val, False, False, 0)
+                self.grid.attach(box, i % 4, i // 4, 1, 1)
+                self.tiles[key] = val
+                self.tile_labels[key] = lab
+
+            # budget meters (also shown in mini mode)
+            meters = Gtk.Box(spacing=12)
+            meters.set_margin_top(10)
+            self.full_meters = {}
+            for key in ("hour5", "week"):
+                col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+                col.set_hexpand(True)
+                row = Gtk.Box(spacing=4)
+                lab = Gtk.Label()
+                lab.get_style_context().add_class("meter-label")
+                lab.set_halign(Gtk.Align.START)
+                pct = Gtk.Label()
+                pct.get_style_context().add_class("meter-pct")
+                row.pack_start(lab, True, True, 0)
+                row.pack_end(pct, False, False, 0)
+                bar = make_meter()
+                col.pack_start(row, False, False, 0)
+                col.pack_start(bar, False, False, 0)
+                meters.pack_start(col, True, True, 0)
+                self.full_meters[key] = (lab, pct, bar)
+            outer.pack_start(meters, False, False, 0)
+
+            # heatmap stays chronological left→right in both languages
+            self.heatmap = Gtk.Grid(column_spacing=2, row_spacing=2)
+            self.heatmap.set_margin_top(10)
+            self.heatmap.set_direction(Gtk.TextDirection.LTR)
+            self.heatmap.set_halign(Gtk.Align.FILL)
+            self.heatmap.set_hexpand(True)
+            self.heatmap.set_column_homogeneous(True)
+            self.heatmap.connect("size-allocate", self.on_heatmap_allocate)
+            self.heat_cell_px = 0
+            self.heat_cells = {}
+            for col in range(HEATMAP_WEEKS):
+                for row in range(7):
+                    cell = Gtk.Box()
+                    cell.set_hexpand(True)
+                    cell.set_size_request(11, 11)
+                    cell.get_style_context().add_class("h0")
+                    self.heatmap.attach(cell, col, row, 1, 1)
+                    self.heat_cells[(col, row)] = cell
+            outer.pack_start(self.heatmap, False, False, 0)
+
+            # Clawd's walking strip
+            self.anim_area = Gtk.Fixed()
+            self.anim_area.set_size_request(-1, 72)
+            self.anim_area.set_direction(Gtk.TextDirection.LTR)
+            self.clawd_big = Gtk.Image.new_from_pixbuf(self.frames_big.get())
+            self.anim_area.put(self.clawd_big, 10, 2)
+            outer.pack_start(self.anim_area, False, False, 0)
+
+            self.footer = Gtk.Label(label="")
+            self.footer.get_style_context().add_class("footer")
+            self.footer.set_halign(Gtk.Align.START)
+            self.footer.set_line_wrap(True)
+            outer.pack_start(self.footer, False, False, 0)
+
+            self.stack.add_named(outer, "expanded")
+
+        def build_mini(self):
+            outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            outer.get_style_context().add_class("card-mini")
+            for m in ("top", "bottom", "start", "end"):
+                getattr(outer, f"set_margin_{m}")(4)
+            outer.set_size_request(170, -1)
+
+            top = Gtk.Box(spacing=4)
+            # Clawd lives in the corner of the cube
+            corner = Gtk.Fixed()
+            corner.set_size_request(46, 32)
+            corner.set_direction(Gtk.TextDirection.LTR)
+            self.clawd_mini = Gtk.Image.new_from_pixbuf(self.frames_mini.get())
+            corner.put(self.clawd_mini, 0, 4)
+            top.pack_start(corner, False, False, 0)
+
+            brand = Gtk.Label(label="Claude")
+            brand.get_style_context().add_class("brand")
+            brand.set_halign(Gtk.Align.START)
+            top.pack_start(brand, True, True, 0)
+
+            expand_btn = Gtk.Button(label="⤢")
+            expand_btn.get_style_context().add_class("headerbtn")
+            expand_btn.set_relief(Gtk.ReliefStyle.NONE)
+            expand_btn.set_valign(Gtk.Align.START)
+            expand_btn.connect("clicked", lambda *_: self.set_mode("expanded"))
+            top.pack_end(expand_btn, False, False, 0)
+
+            mini_refresh = Gtk.Button(label="\u27f3")
+            mini_refresh.get_style_context().add_class("headerbtn")
+            mini_refresh.set_relief(Gtk.ReliefStyle.NONE)
+            mini_refresh.set_valign(Gtk.Align.START)
+            mini_refresh.connect("clicked", self.on_manual_refresh)
+            top.pack_end(mini_refresh, False, False, 0)
+            outer.pack_start(top, False, False, 0)
+
+            self.mini_meters = {}
+            for key in ("hour5", "week"):
+                row = Gtk.Box(spacing=4)
+                lab = Gtk.Label()
+                lab.get_style_context().add_class("meter-label")
+                lab.set_halign(Gtk.Align.START)
+                pct = Gtk.Label()
+                pct.get_style_context().add_class("meter-pct")
+                row.pack_start(lab, True, True, 0)
+                row.pack_end(pct, False, False, 0)
+                bar = make_meter()
+                outer.pack_start(row, False, False, 0)
+                outer.pack_start(bar, False, False, 0)
+                self.mini_meters[key] = (lab, pct, bar)
+
+            self.stack.add_named(outer, "mini")
+
+        # ------------------------------------------------------- behavior
+        def set_mode(self, mode, first=False):
+            self.mode = mode
+            self.stack.set_visible_child_name(mode)
+            if not first:
+                self.config = update_config(mode=mode)
+            self.resize(1, 1)  # shrink window to fit the visible page
+
+        def apply_direction(self):
+            direction = (Gtk.TextDirection.RTL if self.lang == "he"
+                         else Gtk.TextDirection.LTR)
+            Gtk.Widget.set_default_direction(direction)
+
+        def apply_language(self):
+            t = TR[self.lang]
+            self.title_label.set_text(t["title"])
+            self.lang_btn.set_label(t["toggle"])
+            for key in STAT_KEYS:
+                self.tile_labels[key].set_text(t[key])
+            self.tick_countdown()
+            for key in self.full_meters:   # re-applied per refresh as well
+                pass
+            if self.stats:
+                self.footer.set_text(hp_line(self.stats["total_tokens"], self.lang))
+
+        def on_manual_refresh(self, btn):
+            btn.set_sensitive(False)
+            self.refresh()
+            # brief disable so a double-click cannot queue two full rescans
+            GLib.timeout_add(400, lambda: btn.set_sensitive(True) or False)
+
+        def on_toggle_lang(self, _btn):
+            self.lang = "en" if self.lang == "he" else "he"
+            self.config = update_config(lang=self.lang)
+            self.apply_direction()
+            self.apply_language()
+            self.queue_resize()
+
+        def on_press(self, _w, event):
+            if event.button == 1:
+                self.begin_move_drag(1, int(event.x_root), int(event.y_root),
+                                     event.time)
+            return False
+
+        def on_key(self, _w, event):
+            if event.keyval == Gdk.KEY_Escape:
+                Gtk.main_quit()
+            return False
+
+        # --------------------------------------------------------- data
+        def watch(self):
+            """Cheap tick: notice live sessions, fresh data and new code."""
+            newest = newest_transcript_mtime()
+            was_active = self.session_active
+            self.session_active = (time.time() - newest) < ACTIVE_WINDOW
+            # a live session changes the numbers fast — refresh right away
+            if self.session_active and newest > self.last_seen_mtime:
+                self.last_seen_mtime = newest
+                self.refresh()
+            elif was_active and not self.session_active:
+                self.refresh()
+            # the script rewrote itself (an upgrade) — restart into it
+            mtime = script_mtime()
+            if mtime and self.script_mtime and mtime != self.script_mtime:
+                self.restart()
+            return True
+
+        def restart(self):
+            # Never exec into a half-written or broken file: a mid-edit save
+            # once killed the widget outright. Compile first, and if it does
+            # not parse, keep running the code already in memory.
+            try:
+                compile(SCRIPT_PATH.read_text(encoding="utf-8"),
+                        str(SCRIPT_PATH), "exec")
+            except (SyntaxError, OSError, ValueError):
+                return
+            # nothing to persist here: every setting is written when it changes
+            os.execv(sys.executable, [sys.executable, str(SCRIPT_PATH)])
+
+        def refresh(self):
+            try:
+                self.stats = collect_stats()
+            except Exception as exc:  # keep the widget alive on parse errors
+                self.footer.set_text(TR[self.lang]["err"].format(e=exc))
+                return True
+            s = self.stats
+            self.tiles["sessions"].set_text(str(s["sessions"]))
+            self.tiles["messages"].set_text(str(s["messages"]))
+            self.tiles["total_tokens"].set_text(fmt_num(s["total_tokens"]))
+            self.tiles["active_days"].set_text(str(s["active_days"]))
+            self.tiles["current_streak"].set_text(f'{s["current_streak"]}d')
+            self.tiles["longest_streak"].set_text(f'{s["longest_streak"]}d')
+            self.tiles["peak_hour"].set_text(fmt_hour(s["peak_hour"]))
+            self.tiles["favorite_model"].set_text(s["favorite_model"])
+            self.footer.set_text(hp_line(s["total_tokens"], self.lang))
+            self.tick_countdown()
+            self.check_alerts(s)
+            self.update_heatmap()
+            return True  # keep the GLib timer running
+
+        def spawn_usage_poll(self):
+            """Refresh the real quota off-thread so the UI never stalls."""
+            if self.polling:
+                return True
+            self.polling = True
+
+            def work():
+                report = poll_usage()
+                def done():
+                    self.polling = False
+                    if report:
+                        self.refresh()
+                    return False
+                GLib.idle_add(done)
+
+            threading.Thread(target=work, daemon=True).start()
+            return True
+
+        def tick_countdown(self):
+            """Second-by-second countdown to each window's reset."""
+            if not self.stats:
+                return True
+            t = TR[self.lang]
+            now = time.time()
+            for key, win_key in (("hour5", "window_5h"), ("week", "window_7d")):
+                win = self.stats.get(win_key) or {}
+                resets = win.get("resets_at")
+                span = win.get("window_seconds") or 1
+                if resets:
+                    left = max(0, int(resets - now))
+                    elapsed = 100.0 * (1 - left / span)
+                    countdown = fmt_countdown(left, self.lang)
+                else:
+                    # no open window: the session is over, quota is fresh
+                    left, elapsed, countdown = 0, 100.0, t["fresh"]
+
+                quota = win.get("quota_pct")
+                real_quota = quota is not None
+                if real_quota:
+                    # the honest meter: how much of the quota is gone,
+                    # straight from the server's own answer to /usage
+                    elapsed = float(quota)
+                    text = f"{quota:.0f}%"
+                    tip = t["tip_quota"].format(age=win.get("quota_age_min") or 0,
+                                                reset=win.get("quota_reset") or "?")
+                elif key == "hour5":
+                    text = f"{elapsed:.0f}%"
+                    tip = t["tip_session"].format(left=countdown)
+                else:
+                    text = countdown
+                    tip = t["tip_countdown"]
+                for meters in (self.full_meters, self.mini_meters):
+                    if key not in meters:
+                        continue
+                    lab, val, bar = meters[key]
+                    lab.set_text(t[f"{key}_short" if meters is self.mini_meters
+                                   else (f"{key}_quota" if real_quota
+                                         else f"{key}_reset")])
+                    val.set_text(text)
+                    bar.set_value(max(0.0, min(100.0, elapsed)))
+                    ctx = bar.get_style_context()
+                    # real quota gets the warning colours; time progress stays
+                    # neutral, because a session ending is not a danger
+                    (ctx.remove_class if real_quota else ctx.add_class)("recordbar")
+                    bar.set_tooltip_text(tip)
+            return True
+
+        def meter_tooltip(self, key, s):
+            """Say plainly what this bar's 100% actually means."""
+            t = TR[self.lang]
+            return t["tip_countdown"]
+
+        def check_alerts(self, s):
+            """Warn before the window runs out, not after."""
+            t = TR[self.lang]
+            for key, pct_key, win_key in (
+                    ("hour5", "session_quota_pct", "window_5h"),
+                    ("week", "week_quota_pct", "window_7d")):
+                pct = s.get(pct_key)
+                if pct is None:
+                    continue    # no real number yet, nothing worth warning about
+                level = 100 if pct >= 100 else 95 if pct >= 95 else 80 if pct >= 80 else None
+                if level is None:
+                    self.alerted.pop(key, None)   # window recovered — re-arm
+                    continue
+                if self.alerted.get(key) == level:
+                    continue
+                self.alerted[key] = level
+                reset = s[win_key].get("quota_reset")
+                body = (t["alert_done"] if level >= 100
+                        else t["alert_reset"].format(reset=reset or "?"))
+                subprocess.run(
+                    ["notify-send", "-a", "Claude Stats",
+                     "-i", str(ICON_PATH),
+                     "-h", "string:desktop-entry:claude-stats-widget",
+                     "-u", "critical" if level >= 95 else "normal",
+                     t[f"alert_title_{key}"].format(pct=pct), body],
+                    check=False)
+
+        def on_heatmap_allocate(self, widget, alloc):
+            """Keep cells square as the grid stretches to the card width."""
+            gap = 2
+            usable = alloc.width - gap * (HEATMAP_WEEKS - 1)
+            # homogeneous columns round the width up, so round the height the
+            # same way — otherwise the cells come out a pixel off square
+            size = max(6, round(usable / HEATMAP_WEEKS))
+            if size == self.heat_cell_px:
+                return
+            self.heat_cell_px = size
+            for cell in self.heat_cells.values():
+                cell.set_size_request(-1, size)   # width comes from the grid
+
+        def update_heatmap(self):
+            activity = {
+                date.fromisoformat(k): v
+                for k, v in self.stats.get("day_activity", {}).items()
+            }
+            peak = max(activity.values(), default=1) or 1
+            today = date.today()
+            # columns = weeks (oldest→newest), rows = Sun..Sat
+            end_week_start = week_start(today)
+            for col in range(HEATMAP_WEEKS):
+                ws = end_week_start - timedelta(weeks=HEATMAP_WEEKS - 1 - col)
+                for row in range(7):
+                    d = ws + timedelta(days=row)
+                    count = activity.get(d, 0) if d <= today else 0
+                    level = 0 if count <= 0 else 1 + min(3, int(3 * count / peak))
+                    ctx = self.heat_cells[(col, row)].get_style_context()
+                    for lv in range(5):
+                        ctx.remove_class(f"h{lv}")
+                    ctx.add_class(f"h{level}")
+
+        # ---------------------------------------------------- animation
+        def pick_activity(self):
+            # context first: he types along while a session is live, and
+            # sulks once the weekly budget is gone
+            if self.session_active and random.random() < 0.55:
+                return ["type", random.randint(40, 90)]
+            if (self.stats.get("week_quota_pct") or 0) >= 95 and random.random() < 0.22:
+                return ["sad", random.randint(25, 50)]
+            r = random.random()
+            if r < 0.26:
+                return ["walk", random.randint(50, 140)]
+            if r < 0.36:
+                return ["run", random.randint(30, 70)]
+            if r < 0.46:
+                return ["idle", random.randint(15, 40)]
+            if r < 0.56:
+                return ["look", 27]
+            if r < 0.64:
+                return ["wave", 24]
+            if r < 0.72:
+                return ["jump", 24]
+            if r < 0.81:
+                return ["exercise", 36]
+            if r < 0.90:
+                return ["flag", 40]
+            if r < 0.96:
+                return ["stomp", 26]
+            return ["sleep", random.randint(40, 90)]
+
+        def animate_big(self):
+            if self.mode != "expanded" or not self.get_visible():
+                return True
+            self.anim_tick += 1
+            if self.act[1] <= 0:
+                self.act = self.pick_activity()
+            self.act[1] -= 1
+            name, left = self.act
+            feet, eyes, arms, zzz, y = "idle", "open", None, 0, 2
+            flag = laptop = 0
+            confetti = -1
+            flip = self.anim_dir < 0
+
+            if name in ("walk", "run"):
+                speed, swap = (2, 2) if name == "walk" else (5, 1)
+                self.anim_x += speed * self.anim_dir
+                width = max(self.anim_area.get_allocated_width(), 140)
+                max_x = width - CANVAS_W * 5 - 4
+                if self.anim_x <= 2:
+                    self.anim_x, self.anim_dir = 2, 1
+                elif self.anim_x >= max_x:
+                    self.anim_x, self.anim_dir = max_x, -1
+                feet = "walk1" if (self.anim_tick // swap) % 2 else "walk2"
+                if name == "run":
+                    arms = "mid"
+                    y = 2 + (-1 if (self.anim_tick // swap) % 2 else 0)
+            elif name == "idle":
+                if self.anim_blink > 0:
+                    self.anim_blink -= 1
+                    eyes = "closed"
+                elif random.random() < 0.07:
+                    self.anim_blink = 2
+                    eyes = "closed"
+            elif name == "look":
+                phase = 27 - left
+                eyes = "left" if phase < 9 else "right" if phase < 18 else "open"
+            elif name == "wave":
+                arms = "up" if (self.anim_tick // 3) % 2 else "mid"
+            elif name == "jump":
+                phase = (24 - left) % len(JUMP_Y)
+                y = 2 + JUMP_Y[phase]
+                feet = "tuck" if y < 2 else "idle"
+            elif name == "exercise":
+                # jumping jacks: arms up + legs apart, then back together
+                if (self.anim_tick // 3) % 2:
+                    arms, feet, y = "both_up", "spread", 0
+                else:
+                    arms, feet, y = "both_mid", "idle", 2
+            elif name == "flag":
+                arms = "up"
+                flag = 1 if (self.anim_tick // 3) % 2 else 2
+            elif name == "stomp":
+                phase = 26 - left
+                if phase < len(JUMP_Y):
+                    y = 2 + JUMP_Y[phase]
+                    feet = "tuck" if y < 2 else "idle"
+                else:
+                    confetti = phase - len(JUMP_Y)
+                    feet = "spread"
+            elif name == "type":
+                laptop = 2 if (self.anim_tick // 4) % 2 else 1
+                arms, feet, flip = "mid", "tuck", False
+                if random.random() < 0.05:
+                    eyes = "closed"
+            elif name == "sad":
+                eyes, feet, y = "sad", "tuck", 4
+            elif name == "sleep":
+                eyes = "closed"
+                zzz = 1 if (self.anim_tick // 5) % 2 else 2
+
+            frame = self.frames_big.get(feet, eyes, arms, zzz, flag, laptop,
+                                        confetti, flip=flip)
+            self.clawd_big.set_from_pixbuf(frame)
+            self.anim_area.move(self.clawd_big, int(self.anim_x), y)
+            return True
+
+        def animate_mini(self):
+            if self.mode != "mini" or not self.get_visible():
+                return True
+            self.mini_tick += 1
+            eyes, arms, y, feet, laptop = "open", None, 4, "idle", 0
+            if self.session_active:
+                # busy-but-calm: types along in the corner
+                laptop = 2 if (self.mini_tick // 2) % 2 else 1
+                arms, feet = "mid", "tuck"
+                if random.random() < 0.08:
+                    eyes = "closed"
+            elif self.mini_wave > 0:
+                self.mini_wave -= 1
+                arms = "up" if self.mini_wave % 2 else "mid"
+            elif self.mini_hop > 0:
+                self.mini_hop -= 1
+                y = 1
+                feet = "tuck"
+            elif (self.stats.get("week_quota_pct") or 0) >= 95 and random.random() < 0.15:
+                eyes, feet = "sad", "tuck"
+            elif random.random() < 0.10:
+                eyes = "closed"
+            elif random.random() < 0.03:
+                self.mini_hop = 2
+            elif random.random() < 0.02:
+                self.mini_wave = 8
+            self.clawd_mini.set_from_pixbuf(
+                self.frames_mini.get(feet, eyes, arms, laptop=laptop))
+            self.clawd_mini.get_parent().move(self.clawd_mini, 0, y)
+            return True
+
+    if not ICON_PATH.exists():
+        write_icon()
+    win = Widget()
+    try:
+        win.set_icon_from_file(str(ICON_PATH))
+    except Exception:
+        pass
+    win.connect("destroy", Gtk.main_quit)
+    win.show_all()
+    win.stack.set_visible_child_name(win.mode)
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    if "--write-icon" in sys.argv:
+        sys.exit(0 if write_icon() else 1)
+    if "--json" in sys.argv:
+        print(json.dumps(collect_stats(), ensure_ascii=False, indent=2))
+    else:
+        run_gui()

@@ -1,0 +1,20 @@
+# python
+__pycache__/
+*.py[cod]
+
+# never commit anything holding real usage data or credentials
+*.log
+*.json
+!.github/**/*.json
+.env*
+!.env.example
+*.key
+*.pem
+*.pfx
+client_secret*.json
+
+# editors / os
+.vscode/
+.idea/
+*.swp
+.DS_Store
