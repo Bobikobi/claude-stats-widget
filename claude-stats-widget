@@ -301,6 +301,8 @@ def update_config(**changes):
 def newest_transcript_mtime():
     newest = 0.0
     for jf in PROJECTS_DIR.glob("*/*.jsonl"):
+        if jf.parent.name == POLL_PROJECT:
+            continue
         try:
             newest = max(newest, jf.stat().st_mtime)
         except OSError:
@@ -337,6 +339,14 @@ def fmt_num(n):
 
 USAGE_CACHE = Path.home() / ".cache" / "claude-stats-widget-usage.json"
 USAGE_POLL_SECONDS = 300      # /usage is answered locally and costs nothing
+# Every `claude -p` call opens a session and writes a transcript. Run the poll
+# from its own directory so those land in one predictable project folder that
+# we can skip while counting and clear afterwards - otherwise the widget ends
+# up counting its own polling as your usage.
+POLL_DIR = Path.home() / ".cache" / "claude-stats-widget" / "poll"
+# Claude Code names a project folder after its cwd, with "/" and "."
+# both flattened to "-"
+POLL_PROJECT = str(POLL_DIR).replace("/", "-").replace(".", "-")
 SESSION_RE = re.compile(r"Current session:\s*(\d+)%\s*used[^\n]*?resets\s*([^(\n]+)")
 WEEK_RE = re.compile(r"Current week[^:\n]*:\s*(\d+)%\s*used[^\n]*?resets\s*([^(\n]+)")
 
@@ -362,12 +372,15 @@ def poll_usage():
     num_turns 0 and total_cost_usd 0. Runs headless, no window.
     """
     try:
+        POLL_DIR.mkdir(parents=True, exist_ok=True)
         proc = subprocess.run(
             ["claude", "-p", "/usage", "--output-format", "json"],
-            capture_output=True, text=True, timeout=90)
+            capture_output=True, text=True, timeout=90, cwd=str(POLL_DIR))
         data = json.loads(proc.stdout)
     except Exception:
         return None
+    finally:
+        clear_poll_transcripts()
     report = parse_usage(data.get("result") or "")
     if report:
         try:
@@ -376,6 +389,15 @@ def poll_usage():
         except OSError:
             pass
     return report
+
+
+def clear_poll_transcripts():
+    """Delete the throwaway sessions our own polling just created."""
+    for jf in (PROJECTS_DIR / POLL_PROJECT).glob("*.jsonl"):
+        try:
+            jf.unlink()
+        except OSError:
+            pass
 
 
 def load_usage_cache():
@@ -418,6 +440,8 @@ def collect_stats():
     model_counter = Counter()
 
     for jf in PROJECTS_DIR.glob("*/*.jsonl"):
+        if jf.parent.name == POLL_PROJECT:
+            continue        # our own /usage polls, not real sessions
         try:
             with open(jf, encoding="utf-8", errors="replace") as fh:
                 for line in fh:
