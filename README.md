@@ -52,32 +52,32 @@ Nothing is uploaded anywhere. The widget makes no network calls of its own.
 
 ## Install
 
-Pick your platform. Both installers write only inside your own user profile and
-neither needs root or administrator rights.
-
-<details open>
-<summary><b>Linux</b> (GTK3)</summary>
-
-```sh
-git clone https://github.com/Bobikobi/claude-stats-widget.git
-cd claude-stats-widget
-./install.sh
-```
-
-`install.sh` copies the script to `~/.local/bin`, generates the Clawd icon,
-installs a desktop entry, and offers to start it at login. To remove
-everything, run `./install.sh --uninstall`.
-
-Manual install is just as easy - the widget is a single self-contained file:
-
-```sh
-cp claude-stats-widget ~/.local/bin/ && chmod +x ~/.local/bin/claude-stats-widget
-```
-
-</details>
+One line, no clone. Both installers write only inside your own user profile,
+need no root or administrator rights, and put a shortcut on your desktop and in
+your applications menu. Neither needs an editor, an IDE or any build tooling:
+just Python, which is already there on most Linux desktops.
 
 <details open>
 <summary><b>Windows</b> (Tkinter)</summary>
+
+```powershell
+irm https://raw.githubusercontent.com/Bobikobi/claude-stats-widget/main/install.ps1 | iex
+```
+
+That fetches the widget, installs it to
+`%LOCALAPPDATA%\Programs\claude-stats-widget`, draws the Clawd icon, adds
+desktop and Start Menu shortcuts, and starts it.
+
+To pass options through the one-liner, run it as a scriptblock:
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/Bobikobi/claude-stats-widget/main/install.ps1))) -Uninstall
+```
+
+`-Uninstall` removes everything and leaves your settings alone. The other
+switches are `-NoAutostart`, `-NoDesktopShortcut` and `-NoLaunch`.
+
+From a clone it is the same script:
 
 ```powershell
 git clone https://github.com/Bobikobi/claude-stats-widget.git
@@ -85,11 +85,8 @@ cd claude-stats-widget
 .\install.ps1
 ```
 
-`install.ps1` copies the widget to `%LOCALAPPDATA%\Programs\claude-stats-widget`,
-draws the Clawd icon, adds a Start Menu entry and offers a Startup shortcut.
-`.\install.ps1 -Uninstall` removes it all and leaves your settings alone.
-
-If PowerShell refuses to run it, that is the execution policy, not the script:
+If PowerShell refuses to run it from disk, that is the execution policy, not
+the script:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\install.ps1
@@ -97,6 +94,35 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 
 Manual install is a copy plus a shortcut to `pythonw.exe "<the file>"`. Use
 `pythonw`, not `python`, or you get a console window next to the widget.
+
+</details>
+
+<details open>
+<summary><b>Linux</b> (GTK3)</summary>
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Bobikobi/claude-stats-widget/main/install.sh | bash
+```
+
+That fetches the widget, installs it to `~/.local/bin`, draws the Clawd icon,
+adds a desktop entry plus a desktop shortcut, and starts it. Piped like this
+there is nobody to answer the autostart question, so it is not enabled; run the
+script from a terminal if you want it.
+
+```sh
+git clone https://github.com/Bobikobi/claude-stats-widget.git
+cd claude-stats-widget
+./install.sh
+```
+
+`./install.sh --uninstall` removes everything and leaves your settings alone;
+`--no-desktop-shortcut` skips the desktop copy.
+
+Manual install is just as easy - the widget is a single self-contained file:
+
+```sh
+cp claude-stats-widget ~/.local/bin/ && chmod +x ~/.local/bin/claude-stats-widget
+```
 
 </details>
 
@@ -163,6 +189,7 @@ per-platform, and the file picks its toolkit at startup:
 | Settings | `~/.config` | `%APPDATA%` |
 | Cache and icon | `~/.cache`, `~/.local/share/icons` | `%LOCALAPPDATA%` |
 | Autostart | XDG autostart entry | Startup shortcut |
+| Shortcuts | applications menu + desktop | Start Menu + desktop |
 
 The Clawd icon is encoded as a PNG (and, on Windows, an ICO) by hand from the
 standard library, so it can be drawn on a machine that has no image toolkit
@@ -182,6 +209,11 @@ Always-on-top just works here.
 
 Either way, the Claude Code CLI on `PATH` gets you the real quota numbers. It is
 optional: the widget works without it, minus the quota meters.
+
+Nothing else is required. In particular there is no editor or IDE in the
+picture: the widget reads the transcript files Claude Code writes, so it works
+the same whether you drive Claude Code from a terminal, from an editor
+extension, or not at all while it sits there showing you yesterday's numbers.
 
 ## Notes and limits
 

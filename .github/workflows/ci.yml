@@ -90,3 +90,7 @@ jobs:
         run: |
           test -x install.sh || { echo "install.sh is not executable"; exit 1; }
           bash -n install.sh
+          # a shell script with CRLF dies on Linux with a baffling error, and
+          # a Windows checkout is enough to introduce it
+          ! grep -qU $'\r' install.sh || { echo "install.sh has CRLF"; exit 1; }
+          ! grep -qU $'\r' claude-stats-widget || { echo "widget has CRLF"; exit 1; }
