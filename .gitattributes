@@ -1,0 +1,14 @@
+# This repo is cloned and edited on both Linux and Windows, so pin the line
+# endings rather than leave them to whoever commits. A shell script or a
+# Python entry point with CRLF fails on Linux with a confusing error about
+# the interpreter, and a checkout on Windows is enough to introduce it.
+* text=auto eol=lf
+
+install.sh        text eol=lf
+claude-stats-widget text eol=lf
+
+# PowerShell is happiest with CRLF and only ever runs on Windows
+*.ps1 text eol=crlf
+
+*.png binary
+*.ico binary
