@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Claude Code usage widget — reads ~/.claude/projects/**/*.jsonl and shows
-usage stats in a small always-available desktop window (GTK3).
+usage stats in a small always-available desktop window.
+
+Two GUI backends, one file: GTK3 on Linux, Tkinter on Windows. Everything
+above the backend split — stats, quota polling, Clawd, config — is shared, so
+the two builds can never drift apart in what they report.
 
 Modes: expanded (full stats + walking Clawd) and mini (small cube with
 remaining-budget meters + Clawd in the corner).
@@ -11,18 +15,39 @@ import json
 import os
 import random
 import re
+import shutil
+import struct
 import subprocess
 import threading
 import sys
 import time
+import zlib
 from collections import Counter
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+IS_WINDOWS = os.name == "nt"
+
 SCRIPT_PATH = Path(__file__).resolve()
-ICON_PATH = Path.home() / ".local" / "share" / "icons" / "claude-clawd.png"
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
-CONFIG_PATH = Path.home() / ".config" / "claude-stats-widget.json"
+
+if IS_WINDOWS:
+    # Windows keeps roaming preferences and machine-local caches apart, and
+    # honours the env vars over the profile path — a redirected AppData is
+    # common on domain machines.
+    _APPDATA = Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming")
+    _LOCALAPPDATA = Path(os.environ.get("LOCALAPPDATA")
+                         or Path.home() / "AppData" / "Local")
+    APP_DIR = _LOCALAPPDATA / "claude-stats-widget"
+    CONFIG_PATH = _APPDATA / "claude-stats-widget" / "config.json"
+    ICON_PATH = APP_DIR / "claude-clawd.png"
+    ICO_PATH = APP_DIR / "claude-clawd.ico"
+else:
+    APP_DIR = Path.home() / ".cache" / "claude-stats-widget"
+    CONFIG_PATH = Path.home() / ".config" / "claude-stats-widget.json"
+    ICON_PATH = Path.home() / ".local" / "share" / "icons" / "claude-clawd.png"
+    ICO_PATH = None
+
 REFRESH_SECONDS = 30
 WATCH_SECONDS = 5      # live-session / self-update poll
 ACTIVE_WINDOW = 90     # a transcript touched this recently means "in a session"
@@ -38,7 +63,7 @@ MODEL_NAMES = {
 
 TR = {
     "he": {
-        "title": "✳ Claude Code — שימוש",
+        "title": "✳ Claude Code - שימוש",
         "sessions": "סשנים",
         "messages": "הודעות",
         "total_tokens": "סה״כ טוקנים",
@@ -56,7 +81,7 @@ TR = {
         "alert_done": "המכסה נגמרה. צריך לחכות לאיפוס.",
         "alert_reset": "מתאפס {reset}.",
         "hour5_reset": "5 שעות · הסשן",
-        "tip_session": "100% = הסשן נגמר והמכסה נפתחת מחדש. נותרו {left}.\nזו התקדמות בזמן, לא ניצול מכסה — הרץ /usage למספר האמיתי.",
+        "tip_session": "100% = הסשן נגמר והמכסה נפתחת מחדש. נותרו {left}.\nזו התקדמות בזמן, לא ניצול מכסה - הרץ /usage למספר האמיתי.",
         "hour5_quota": "סשן · ניצול מכסה",
         "week_quota": "שבוע · ניצול מכסה",
         "tip_quota": "מכסה אמיתית מהשרת. 100% = חסימה.\nמתאפס {reset} · נבדק לפני {age} דקות.",
@@ -67,7 +92,7 @@ TR = {
         "week_short": "7 ימים",
     },
     "en": {
-        "title": "✳ Claude Code — Usage",
+        "title": "✳ Claude Code - Usage",
         "sessions": "Sessions",
         "messages": "Messages",
         "total_tokens": "Total tokens",
@@ -226,22 +251,64 @@ def clawd_grid(feet="idle", eyes="open", arms=None, zzz=0, flag=0,
     return ["".join(r) for r in canvas]
 
 
+def _png_chunk(tag, payload):
+    body = tag + payload
+    return struct.pack(">I", len(payload)) + body + struct.pack(">I",
+                                                                zlib.crc32(body))
+
+
+def clawd_png(grid, cell):
+    """Encode the pixel grid as an RGBA PNG, using nothing but the stdlib.
+
+    Rendering the icon through a toolkit would mean the icon can only be
+    written where that toolkit is installed — and on Windows there is none.
+    Pixel art is a handful of solid rectangles, so encode it directly.
+    """
+    rgba = {}
+    for ch, hexcol in CLAWD_COLORS.items():
+        rgba[ch] = bytes.fromhex(hexcol[1:]) + b"\xff"
+    transparent = b"\x00\x00\x00\x00"
+
+    w, h = len(grid[0]) * cell, len(grid) * cell
+    raw = bytearray()
+    for row in grid:
+        line = bytearray()
+        for ch in row:
+            line += rgba.get(ch, transparent) * cell
+        for _ in range(cell):
+            raw += b"\x00" + line          # filter type 0, one byte per scanline
+
+    header = struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0)   # 8-bit RGBA
+    return (b"\x89PNG\r\n\x1a\n"
+            + _png_chunk(b"IHDR", header)
+            + _png_chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+            + _png_chunk(b"IEND", b""))
+
+
+def icon_grid():
+    """Clawd's face, cropped out of the animation canvas' empty margin."""
+    return [row[3:19] for row in clawd_grid("idle", "open")[3:]]
+
+
 def write_icon():
-    """Render Clawd to a PNG for the launcher and notifications."""
+    """Render Clawd to a PNG (and on Windows an ICO) for launchers and toasts."""
     try:
-        import gi
-        gi.require_version("GdkPixbuf", "2.0")
-        from gi.repository import GdkPixbuf
         ICON_PATH.parent.mkdir(parents=True, exist_ok=True)
-        grid = clawd_grid("idle", "open")
-        # trim the empty margin so the face fills the icon
-        grid = [row[3:19] for row in grid[3:]]
-        loader = GdkPixbuf.PixbufLoader.new_with_type("svg")
-        loader.write(clawd_svg(grid, 16))       # 256x160 source
-        loader.close()
-        loader.get_pixbuf().savev(str(ICON_PATH), "png", [], [])
+        ICON_PATH.write_bytes(clawd_png(icon_grid(), 16))    # 256x160
+        if ICO_PATH is not None:
+            # A square ICO: Windows scales the entry to whatever size the
+            # shell asks for, but it will not letterbox a non-square one.
+            grid = icon_grid()
+            pad = (len(grid[0]) - len(grid)) // 2
+            square = ([("." * len(grid[0]))] * pad + grid
+                      + [("." * len(grid[0]))] * (len(grid[0]) - len(grid) - pad))
+            png = clawd_png(square, 16)
+            # Vista+ reads a PNG-compressed icon entry directly.
+            ico = struct.pack("<HHH", 0, 1, 1) + struct.pack(
+                "<BBBBHHII", 0, 0, 0, 0, 1, 32, len(png), 22)
+            ICO_PATH.write_bytes(ico + png)
         return True
-    except Exception:
+    except OSError:
         return False    # a missing icon must never stop the widget
 
 
@@ -266,6 +333,15 @@ def default_lang():
     for var in ("LC_ALL", "LC_MESSAGES", "LANG"):
         if (os.environ.get(var) or "").lower().startswith("he"):
             return "he"
+    if IS_WINDOWS:
+        # Windows sets none of those; ask the shell for the UI language.
+        try:
+            import ctypes
+            lang = ctypes.windll.kernel32.GetUserDefaultUILanguage() & 0x3FF
+            if lang == 0x0D:        # LANG_HEBREW
+                return "he"
+        except (OSError, AttributeError, ValueError):
+            pass
     return "en"
 
 
@@ -301,7 +377,7 @@ def update_config(**changes):
 def newest_transcript_mtime():
     newest = 0.0
     for jf in PROJECTS_DIR.glob("*/*.jsonl"):
-        if jf.parent.name == POLL_PROJECT:
+        if is_poll_dir(jf.parent.name):
             continue
         try:
             newest = max(newest, jf.stat().st_mtime)
@@ -315,6 +391,29 @@ def script_mtime():
         return SCRIPT_PATH.stat().st_mtime
     except OSError:
         return None
+
+
+def restart_process():
+    """Relaunch into the script on disk, after an upgrade rewrote it.
+
+    Never exec into a half-written or broken file: a mid-edit save once killed
+    the widget outright. Compile first, and if it does not parse, keep running
+    the code already in memory.
+    """
+    try:
+        compile(SCRIPT_PATH.read_text(encoding="utf-8"), str(SCRIPT_PATH),
+                "exec")
+    except (SyntaxError, OSError, ValueError):
+        return False
+    # nothing to persist here: every setting is written when it changes
+    if IS_WINDOWS:
+        # Windows has no real exec: os.execv leaves the old process id behind
+        # and returns control to a half-torn-down interpreter. Spawn and go.
+        subprocess.Popen([sys.executable, str(SCRIPT_PATH)],
+                         close_fds=True, **NO_WINDOW)
+        os._exit(0)
+    os.execv(sys.executable, [sys.executable, str(SCRIPT_PATH)])
+    return True
 
 
 # ------------------------------------------------------------------- stats
@@ -337,16 +436,108 @@ def fmt_num(n):
     return str(n)
 
 
-USAGE_CACHE = Path.home() / ".cache" / "claude-stats-widget-usage.json"
+USAGE_CACHE = (APP_DIR / "usage.json" if IS_WINDOWS
+               else Path.home() / ".cache" / "claude-stats-widget-usage.json")
 USAGE_POLL_SECONDS = 300      # /usage is answered locally and costs nothing
 # Every `claude -p` call opens a session and writes a transcript. Run the poll
 # from its own directory so those land in one predictable project folder that
 # we can skip while counting and clear afterwards - otherwise the widget ends
 # up counting its own polling as your usage.
-POLL_DIR = Path.home() / ".cache" / "claude-stats-widget" / "poll"
-# Claude Code names a project folder after its cwd, with "/" and "."
-# both flattened to "-"
-POLL_PROJECT = str(POLL_DIR).replace("/", "-").replace(".", "-")
+POLL_DIR = APP_DIR / "poll"
+# Claude Code names a project folder after its cwd, with the separators
+# flattened to "-" ("/" and "." on Linux; "\", ":" and "." on Windows).
+POLL_PROJECT = re.sub(r"[/\\:.]", "-", str(POLL_DIR))
+
+
+POLL_SUFFIX = "claude-stats-widget-poll"
+
+
+def is_poll_dir(name):
+    """True for the project folder our own /usage polling writes into.
+
+    The exact flattening rule is Claude Code's, not ours, so do not stake the
+    whole thing on reproducing it — a case-folded drive letter is enough to
+    make the slug miss, and then the widget quietly counts its own polling as
+    your usage. Fall back on the folder's tail instead. Matching merely on the
+    app's name would be too greedy: a real session opened inside a checkout of
+    this repo lands in a folder named after it, and those transcripts are
+    yours — they get counted, and they never get deleted.
+    """
+    low = name.lower()
+    return low == POLL_PROJECT.lower() or low.endswith(POLL_SUFFIX)
+
+
+def claude_cli():
+    """Absolute path to the Claude Code CLI, or None if it is not installed."""
+    return shutil.which("claude")
+
+
+# Keep every helper process out of sight: on Windows a bare subprocess call
+# from a pythonw.exe GUI pops a console window for a fraction of a second.
+NO_WINDOW = {"creationflags": 0x08000000} if IS_WINDOWS else {}
+
+
+# ----------------------------------------------------------- notifications
+
+# Windows PowerShell, explicitly: the WinRT type accelerators below do not
+# load in PowerShell 7, and `pwsh` is what wins a bare PATH lookup here.
+_POWERSHELL = str(Path(os.environ.get("SystemRoot", r"C:\Windows"))
+                  / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe")
+# Toasts are attributed to an app, and an unregistered AppUserModelID is
+# silently dropped. Borrow PowerShell's own registered id rather than write to
+# the registry — a usage widget has no business installing a shell identity.
+_TOAST_APPID = (r"{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}"
+                r"\WindowsPowerShell\v1.0\powershell.exe")
+# A WinRT type literal may not be wrapped: PowerShell's parser wants the
+# closing bracket on the line it opened.
+_TOAST_PS = """
+$ErrorActionPreference = 'Stop'
+[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null
+[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom, ContentType = WindowsRuntime] > $null
+$xml = New-Object Windows.Data.Xml.Dom.XmlDocument
+$xml.LoadXml($env:CSW_TOAST_XML)
+$toast = New-Object Windows.UI.Notifications.ToastNotification $xml
+$notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($env:CSW_TOAST_APPID)
+$notifier.Show($toast)
+"""
+
+
+def _xml_escape(text):
+    return (str(text).replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;"))
+
+
+def notify(title, body, critical=False):
+    """Raise a desktop notification, or do nothing at all if we cannot.
+
+    A widget that reports on your quota must never itself become the reason a
+    session dies, so every failure here is swallowed.
+    """
+    try:
+        if IS_WINDOWS:
+            logo = ""
+            if ICON_PATH.exists():
+                logo = ('<image placement="appLogoOverride" src="%s"/>'
+                        % _xml_escape(ICON_PATH.as_uri()))
+            xml = ('<toast scenario="%s"><visual><binding '
+                   'template="ToastGeneric">%s<text>%s</text><text>%s</text>'
+                   "</binding></visual></toast>"
+                   % ("reminder" if critical else "default", logo,
+                      _xml_escape(title), _xml_escape(body)))
+            env = dict(os.environ, CSW_TOAST_XML=xml,
+                       CSW_TOAST_APPID=_TOAST_APPID)
+            subprocess.run([_POWERSHELL, "-NoProfile", "-NonInteractive",
+                            "-Command", _TOAST_PS],
+                           env=env, capture_output=True, timeout=20,
+                           check=False, **NO_WINDOW)
+        else:
+            subprocess.run(
+                ["notify-send", "-a", "Claude Stats", "-i", str(ICON_PATH),
+                 "-h", "string:desktop-entry:claude-stats-widget",
+                 "-u", "critical" if critical else "normal", title, body],
+                check=False)
+    except (OSError, subprocess.SubprocessError):
+        pass
 SESSION_RE = re.compile(r"Current session:\s*(\d+)%\s*used[^\n]*?resets\s*([^(\n]+)")
 WEEK_RE = re.compile(r"Current week[^:\n]*:\s*(\d+)%\s*used[^\n]*?resets\s*([^(\n]+)")
 
@@ -371,11 +562,15 @@ def poll_usage():
     Verified free: `/usage` is handled client-side, so the call reports
     num_turns 0 and total_cost_usd 0. Runs headless, no window.
     """
+    cli = claude_cli()
+    if not cli:
+        return None      # no CLI, no real quota — the meters fall back cleanly
     try:
         POLL_DIR.mkdir(parents=True, exist_ok=True)
         proc = subprocess.run(
-            ["claude", "-p", "/usage", "--output-format", "json"],
-            capture_output=True, text=True, timeout=90, cwd=str(POLL_DIR))
+            [cli, "-p", "/usage", "--output-format", "json"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=90, cwd=str(POLL_DIR), **NO_WINDOW)
         data = json.loads(proc.stdout)
     except Exception:
         return None
@@ -393,7 +588,9 @@ def poll_usage():
 
 def clear_poll_transcripts():
     """Delete the throwaway sessions our own polling just created."""
-    for jf in (PROJECTS_DIR / POLL_PROJECT).glob("*.jsonl"):
+    for jf in PROJECTS_DIR.glob("*/*.jsonl"):
+        if not is_poll_dir(jf.parent.name):
+            continue
         try:
             jf.unlink()
         except OSError:
@@ -440,7 +637,7 @@ def collect_stats():
     model_counter = Counter()
 
     for jf in PROJECTS_DIR.glob("*/*.jsonl"):
-        if jf.parent.name == POLL_PROJECT:
+        if is_poll_dir(jf.parent.name):
             continue        # our own /usage polls, not real sessions
         try:
             with open(jf, encoding="utf-8", errors="replace") as fh:
@@ -603,9 +800,192 @@ def hp_line(total, lang):
     return TR[lang]["hp"].format(r=ratio)
 
 
+def alert_messages(stats, alerted, lang):
+    """Warn before a window runs out, not after.
+
+    `alerted` is the caller's memory of what has already fired, and is updated
+    in place: each threshold notifies once, and re-arms only when the quota
+    actually recovers.
+    """
+    t = TR[lang]
+    out = []
+    for key, pct_key, win_key in (("hour5", "session_quota_pct", "window_5h"),
+                                  ("week", "week_quota_pct", "window_7d")):
+        pct = stats.get(pct_key)
+        if pct is None:
+            continue    # no real number yet, nothing worth warning about
+        level = (100 if pct >= 100 else 95 if pct >= 95
+                 else 80 if pct >= 80 else None)
+        if level is None:
+            alerted.pop(key, None)   # window recovered — re-arm
+            continue
+        if alerted.get(key) == level:
+            continue
+        alerted[key] = level
+        reset = (stats.get(win_key) or {}).get("quota_reset")
+        body = (t["alert_done"] if level >= 100
+                else t["alert_reset"].format(reset=reset or "?"))
+        out.append((t[f"alert_title_{key}"].format(pct=pct), body, level >= 95))
+    return out
+
+
+# ------------------------------------------------------- Clawd's activities
+# Which pose Clawd strikes is a decision, not a drawing, so it lives here
+# rather than in either toolkit — the GTK and Tk builds share one engine and
+# cannot drift into being two different characters.
+
+JUMP_Y = [0, -3, -6, -8, -6, -3, 0, 0]
+
+
+class ClawdEngine:
+    """The full-size strip: Clawd walks, works, plays and sulks."""
+
+    def __init__(self):
+        self.x = 10.0
+        self.dir = 1
+        self.tick = 0
+        self.blink = 0
+        self.act = ["walk", 60]
+
+    def pick_activity(self, session_active, week_pct):
+        # context first: he types along while a session is live, and sulks
+        # once the weekly budget is gone
+        if session_active and random.random() < 0.55:
+            return ["type", random.randint(40, 90)]
+        if week_pct >= 95 and random.random() < 0.22:
+            return ["sad", random.randint(25, 50)]
+        r = random.random()
+        if r < 0.26:
+            return ["walk", random.randint(50, 140)]
+        if r < 0.36:
+            return ["run", random.randint(30, 70)]
+        if r < 0.46:
+            return ["idle", random.randint(15, 40)]
+        if r < 0.56:
+            return ["look", 27]
+        if r < 0.64:
+            return ["wave", 24]
+        if r < 0.72:
+            return ["jump", 24]
+        if r < 0.81:
+            return ["exercise", 36]
+        if r < 0.90:
+            return ["flag", 40]
+        if r < 0.96:
+            return ["stomp", 26]
+        return ["sleep", random.randint(40, 90)]
+
+    def step(self, width, cell, session_active, week_pct):
+        """Advance one frame. Returns (frame kwargs, x, y) in pixels."""
+        self.tick += 1
+        if self.act[1] <= 0:
+            self.act = self.pick_activity(session_active, week_pct)
+        self.act[1] -= 1
+        name, left = self.act
+        feet, eyes, arms, zzz, y = "idle", "open", None, 0, 2
+        flag = laptop = 0
+        confetti = -1
+        flip = self.dir < 0
+
+        if name in ("walk", "run"):
+            speed, swap = (2, 2) if name == "walk" else (5, 1)
+            self.x += speed * self.dir
+            max_x = max(width, 140) - CANVAS_W * cell - 4
+            if self.x <= 2:
+                self.x, self.dir = 2, 1
+            elif self.x >= max_x:
+                self.x, self.dir = max_x, -1
+            feet = "walk1" if (self.tick // swap) % 2 else "walk2"
+            if name == "run":
+                arms = "mid"
+                y = 2 + (-1 if (self.tick // swap) % 2 else 0)
+        elif name == "idle":
+            if self.blink > 0:
+                self.blink -= 1
+                eyes = "closed"
+            elif random.random() < 0.07:
+                self.blink = 2
+                eyes = "closed"
+        elif name == "look":
+            phase = 27 - left
+            eyes = "left" if phase < 9 else "right" if phase < 18 else "open"
+        elif name == "wave":
+            arms = "up" if (self.tick // 3) % 2 else "mid"
+        elif name == "jump":
+            phase = (24 - left) % len(JUMP_Y)
+            y = 2 + JUMP_Y[phase]
+            feet = "tuck" if y < 2 else "idle"
+        elif name == "exercise":
+            # jumping jacks: arms up + legs apart, then back together
+            if (self.tick // 3) % 2:
+                arms, feet, y = "both_up", "spread", 0
+            else:
+                arms, feet, y = "both_mid", "idle", 2
+        elif name == "flag":
+            arms = "up"
+            flag = 1 if (self.tick // 3) % 2 else 2
+        elif name == "stomp":
+            phase = 26 - left
+            if phase < len(JUMP_Y):
+                y = 2 + JUMP_Y[phase]
+                feet = "tuck" if y < 2 else "idle"
+            else:
+                confetti = phase - len(JUMP_Y)
+                feet = "spread"
+        elif name == "type":
+            laptop = 2 if (self.tick // 4) % 2 else 1
+            arms, feet, flip = "mid", "tuck", False
+            if random.random() < 0.05:
+                eyes = "closed"
+        elif name == "sad":
+            eyes, feet, y = "sad", "tuck", 4
+        elif name == "sleep":
+            eyes = "closed"
+            zzz = 1 if (self.tick // 5) % 2 else 2
+
+        return (dict(feet=feet, eyes=eyes, arms=arms, zzz=zzz, flag=flag,
+                     laptop=laptop, confetti=confetti, flip=flip),
+                int(self.x), y)
+
+
+class MiniClawdEngine:
+    """The corner of the cube: the same character, doing much less."""
+
+    def __init__(self):
+        self.tick = 0
+        self.hop = 0
+        self.wave = 0
+
+    def step(self, session_active, week_pct):
+        self.tick += 1
+        eyes, arms, y, feet, laptop = "open", None, 4, "idle", 0
+        if session_active:
+            # busy-but-calm: types along in the corner
+            laptop = 2 if (self.tick // 2) % 2 else 1
+            arms, feet = "mid", "tuck"
+            if random.random() < 0.08:
+                eyes = "closed"
+        elif self.wave > 0:
+            self.wave -= 1
+            arms = "up" if self.wave % 2 else "mid"
+        elif self.hop > 0:
+            self.hop -= 1
+            y = 1
+            feet = "tuck"
+        elif week_pct >= 95 and random.random() < 0.15:
+            eyes, feet = "sad", "tuck"
+        elif random.random() < 0.10:
+            eyes = "closed"
+        elif random.random() < 0.03:
+            self.hop = 2
+        elif random.random() < 0.02:
+            self.wave = 8
+        return dict(feet=feet, eyes=eyes, arms=arms, laptop=laptop), y
+
+
 # ---------------------------------------------------------------- GTK widget
 
-def run_gui():
+def run_gui_gtk():
     import gi
 
     gi.require_version("Gtk", "3.0")
@@ -665,8 +1045,6 @@ def run_gui():
                 self.cache[key] = pb.flip(True) if flip else pb
             return self.cache[key]
 
-    JUMP_Y = [0, -3, -6, -8, -6, -3, 0, 0]
-
     def make_meter():
         bar = Gtk.LevelBar.new_for_interval(0, 100)
         bar.set_hexpand(True)
@@ -707,15 +1085,8 @@ def run_gui():
             self.connect("button-press-event", self.on_press)
             self.connect("key-press-event", self.on_key)
 
-            # Clawd activity engine state
-            self.anim_x = 10.0
-            self.anim_dir = 1
-            self.anim_tick = 0
-            self.anim_blink = 0
-            self.act = ["walk", 60]
-            self.mini_tick = 0
-            self.mini_hop = 0
-            self.mini_wave = 0
+            self.clawd = ClawdEngine()
+            self.clawd_mini_engine = MiniClawdEngine()
             self.polling = False
             self.session_active = False
             self.script_mtime = script_mtime()
@@ -973,16 +1344,7 @@ def run_gui():
             return True
 
         def restart(self):
-            # Never exec into a half-written or broken file: a mid-edit save
-            # once killed the widget outright. Compile first, and if it does
-            # not parse, keep running the code already in memory.
-            try:
-                compile(SCRIPT_PATH.read_text(encoding="utf-8"),
-                        str(SCRIPT_PATH), "exec")
-            except (SyntaxError, OSError, ValueError):
-                return
-            # nothing to persist here: every setting is written when it changes
-            os.execv(sys.executable, [sys.executable, str(SCRIPT_PATH)])
+            restart_process()
 
         def refresh(self):
             try:
@@ -1078,31 +1440,9 @@ def run_gui():
             return t["tip_countdown"]
 
         def check_alerts(self, s):
-            """Warn before the window runs out, not after."""
-            t = TR[self.lang]
-            for key, pct_key, win_key in (
-                    ("hour5", "session_quota_pct", "window_5h"),
-                    ("week", "week_quota_pct", "window_7d")):
-                pct = s.get(pct_key)
-                if pct is None:
-                    continue    # no real number yet, nothing worth warning about
-                level = 100 if pct >= 100 else 95 if pct >= 95 else 80 if pct >= 80 else None
-                if level is None:
-                    self.alerted.pop(key, None)   # window recovered — re-arm
-                    continue
-                if self.alerted.get(key) == level:
-                    continue
-                self.alerted[key] = level
-                reset = s[win_key].get("quota_reset")
-                body = (t["alert_done"] if level >= 100
-                        else t["alert_reset"].format(reset=reset or "?"))
-                subprocess.run(
-                    ["notify-send", "-a", "Claude Stats",
-                     "-i", str(ICON_PATH),
-                     "-h", "string:desktop-entry:claude-stats-widget",
-                     "-u", "critical" if level >= 95 else "normal",
-                     t[f"alert_title_{key}"].format(pct=pct), body],
-                    check=False)
+            for title, body, critical in alert_messages(s, self.alerted,
+                                                        self.lang):
+                notify(title, body, critical)
 
         def on_heatmap_allocate(self, widget, alloc):
             """Keep cells square as the grid stretches to the card width."""
@@ -1138,140 +1478,25 @@ def run_gui():
                     ctx.add_class(f"h{level}")
 
         # ---------------------------------------------------- animation
-        def pick_activity(self):
-            # context first: he types along while a session is live, and
-            # sulks once the weekly budget is gone
-            if self.session_active and random.random() < 0.55:
-                return ["type", random.randint(40, 90)]
-            if (self.stats.get("week_quota_pct") or 0) >= 95 and random.random() < 0.22:
-                return ["sad", random.randint(25, 50)]
-            r = random.random()
-            if r < 0.26:
-                return ["walk", random.randint(50, 140)]
-            if r < 0.36:
-                return ["run", random.randint(30, 70)]
-            if r < 0.46:
-                return ["idle", random.randint(15, 40)]
-            if r < 0.56:
-                return ["look", 27]
-            if r < 0.64:
-                return ["wave", 24]
-            if r < 0.72:
-                return ["jump", 24]
-            if r < 0.81:
-                return ["exercise", 36]
-            if r < 0.90:
-                return ["flag", 40]
-            if r < 0.96:
-                return ["stomp", 26]
-            return ["sleep", random.randint(40, 90)]
-
         def animate_big(self):
             if self.mode != "expanded" or not self.get_visible():
                 return True
-            self.anim_tick += 1
-            if self.act[1] <= 0:
-                self.act = self.pick_activity()
-            self.act[1] -= 1
-            name, left = self.act
-            feet, eyes, arms, zzz, y = "idle", "open", None, 0, 2
-            flag = laptop = 0
-            confetti = -1
-            flip = self.anim_dir < 0
-
-            if name in ("walk", "run"):
-                speed, swap = (2, 2) if name == "walk" else (5, 1)
-                self.anim_x += speed * self.anim_dir
-                width = max(self.anim_area.get_allocated_width(), 140)
-                max_x = width - CANVAS_W * 5 - 4
-                if self.anim_x <= 2:
-                    self.anim_x, self.anim_dir = 2, 1
-                elif self.anim_x >= max_x:
-                    self.anim_x, self.anim_dir = max_x, -1
-                feet = "walk1" if (self.anim_tick // swap) % 2 else "walk2"
-                if name == "run":
-                    arms = "mid"
-                    y = 2 + (-1 if (self.anim_tick // swap) % 2 else 0)
-            elif name == "idle":
-                if self.anim_blink > 0:
-                    self.anim_blink -= 1
-                    eyes = "closed"
-                elif random.random() < 0.07:
-                    self.anim_blink = 2
-                    eyes = "closed"
-            elif name == "look":
-                phase = 27 - left
-                eyes = "left" if phase < 9 else "right" if phase < 18 else "open"
-            elif name == "wave":
-                arms = "up" if (self.anim_tick // 3) % 2 else "mid"
-            elif name == "jump":
-                phase = (24 - left) % len(JUMP_Y)
-                y = 2 + JUMP_Y[phase]
-                feet = "tuck" if y < 2 else "idle"
-            elif name == "exercise":
-                # jumping jacks: arms up + legs apart, then back together
-                if (self.anim_tick // 3) % 2:
-                    arms, feet, y = "both_up", "spread", 0
-                else:
-                    arms, feet, y = "both_mid", "idle", 2
-            elif name == "flag":
-                arms = "up"
-                flag = 1 if (self.anim_tick // 3) % 2 else 2
-            elif name == "stomp":
-                phase = 26 - left
-                if phase < len(JUMP_Y):
-                    y = 2 + JUMP_Y[phase]
-                    feet = "tuck" if y < 2 else "idle"
-                else:
-                    confetti = phase - len(JUMP_Y)
-                    feet = "spread"
-            elif name == "type":
-                laptop = 2 if (self.anim_tick // 4) % 2 else 1
-                arms, feet, flip = "mid", "tuck", False
-                if random.random() < 0.05:
-                    eyes = "closed"
-            elif name == "sad":
-                eyes, feet, y = "sad", "tuck", 4
-            elif name == "sleep":
-                eyes = "closed"
-                zzz = 1 if (self.anim_tick // 5) % 2 else 2
-
-            frame = self.frames_big.get(feet, eyes, arms, zzz, flag, laptop,
-                                        confetti, flip=flip)
-            self.clawd_big.set_from_pixbuf(frame)
-            self.anim_area.move(self.clawd_big, int(self.anim_x), y)
+            kw, x, y = self.clawd.step(
+                self.anim_area.get_allocated_width(), 5,
+                self.session_active, self.stats.get("week_quota_pct") or 0)
+            self.clawd_big.set_from_pixbuf(self.frames_big.get(**kw))
+            self.anim_area.move(self.clawd_big, x, y)
             return True
 
         def animate_mini(self):
             if self.mode != "mini" or not self.get_visible():
                 return True
-            self.mini_tick += 1
-            eyes, arms, y, feet, laptop = "open", None, 4, "idle", 0
-            if self.session_active:
-                # busy-but-calm: types along in the corner
-                laptop = 2 if (self.mini_tick // 2) % 2 else 1
-                arms, feet = "mid", "tuck"
-                if random.random() < 0.08:
-                    eyes = "closed"
-            elif self.mini_wave > 0:
-                self.mini_wave -= 1
-                arms = "up" if self.mini_wave % 2 else "mid"
-            elif self.mini_hop > 0:
-                self.mini_hop -= 1
-                y = 1
-                feet = "tuck"
-            elif (self.stats.get("week_quota_pct") or 0) >= 95 and random.random() < 0.15:
-                eyes, feet = "sad", "tuck"
-            elif random.random() < 0.10:
-                eyes = "closed"
-            elif random.random() < 0.03:
-                self.mini_hop = 2
-            elif random.random() < 0.02:
-                self.mini_wave = 8
-            self.clawd_mini.set_from_pixbuf(
-                self.frames_mini.get(feet, eyes, arms, laptop=laptop))
+            kw, y = self.clawd_mini_engine.step(
+                self.session_active, self.stats.get("week_quota_pct") or 0)
+            self.clawd_mini.set_from_pixbuf(self.frames_mini.get(**kw))
             self.clawd_mini.get_parent().move(self.clawd_mini, 0, y)
             return True
+
 
     if not ICON_PATH.exists():
         write_icon()
@@ -1284,6 +1509,623 @@ def run_gui():
     win.show_all()
     win.stack.set_visible_child_name(win.mode)
     Gtk.main()
+
+
+# ----------------------------------------------------------- Tkinter widget
+# The Windows build. Tk ships with Python, so the widget stays a single file
+# with nothing to install — the same promise the GTK build makes on Linux.
+
+TK_BG = "#1a1a18"
+TK_CARD = "#262624"
+TK_TILE = "#30302e"
+TK_FG = "#f5f4ef"
+TK_MUTED = "#9c9a94"
+TK_CORAL = "#D97757"
+TK_TRACK = "#3c3c3a"
+TK_HEAT = ["#3c3c3a", "#4a5a8c", "#4568b8", "#3d6bf2", "#4f78ff"]
+# a record marker is not a limit, so never dress it up as danger
+TK_NEUTRAL = "#5b7bb8"
+
+# Tk 8.6 on Windows lays Hebrew out itself — verified against 8.6.13, which
+# reorders and right-aligns correctly. An earlier version of this backend
+# reversed the strings by hand on the assumption that it would not, and that
+# turned perfectly good Hebrew into gibberish. Pass the text through as-is;
+# only the alignment and the widget order are ours to mirror.
+
+def declare_dpi_aware():
+    """Tell Windows we will do our own scaling.
+
+    Without this, a widget on a 125% or 150% display is rendered at 96 DPI and
+    then bitmap-stretched by the compositor: every label goes soft and the
+    pixel art turns to mush. Ask for per-monitor awareness, fall back to
+    system awareness on Windows 8 and older.
+    """
+    import ctypes
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)   # per-monitor
+    except (AttributeError, OSError):
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except (AttributeError, OSError):
+            pass
+
+
+def run_gui_tk():
+    import tkinter as tk
+
+    declare_dpi_aware()
+    if not ICON_PATH.exists():
+        write_icon()
+    root = tk.Tk()
+    root.withdraw()          # stay hidden until we know where to put it
+    root.title("Claude Stats")
+
+    # Everything below is authored at 96 DPI and scaled up from there, so the
+    # layout is identical on a laptop at 150% and an external screen at 100%.
+    SCALE = root.winfo_fpixels("1i") / 96.0
+
+    def px(n):
+        return max(1, int(round(n * SCALE)))
+
+    HEAT_GAP, HEAT_CELL = px(2), px(18)
+    CONTENT_W = HEATMAP_WEEKS * HEAT_CELL + (HEATMAP_WEEKS - 1) * HEAT_GAP
+    TILE_GAP = px(8)
+    TILE_W = (CONTENT_W - 3 * TILE_GAP) // 4
+    TILE_H = px(54)
+    # the pixel art scales in whole pixels or not at all
+    BIG_CELL, MINI_CELL = max(1, round(5 * SCALE)), max(1, round(2 * SCALE))
+    STRIP_H = px(72)
+    MINI_W = px(170)
+    PAD = px(14)
+    MINI_PAD = px(10)
+    FONT = "Segoe UI"
+
+    class FrameCache:
+        """Clawd's frames, drawn once and kept."""
+
+        def __init__(self, cell, bg):
+            self.cell = cell
+            self.bg = bg
+            self.cache = {}
+
+        def get(self, feet="idle", eyes="open", arms=None, zzz=0, flag=0,
+                laptop=0, confetti=-1, flip=False):
+            key = (feet, eyes, arms, zzz, flag, laptop, confetti, flip)
+            img = self.cache.get(key)
+            if img is None:
+                grid = clawd_grid(feet, eyes, arms, zzz, flag, laptop, confetti)
+                rows = []
+                for row in grid:
+                    chars = row[::-1] if flip else row
+                    rows.append("{" + " ".join(
+                        CLAWD_COLORS.get(ch, self.bg) for ch in chars) + "}")
+                base = tk.PhotoImage(width=CANVAS_W, height=CANVAS_H)
+                base.put(" ".join(rows))
+                # put() one cell at a time would be ~7k Tcl values per frame;
+                # zoom scales the 22x13 original in C instead
+                img = base.zoom(self.cell)
+                self.cache[key] = img
+            return img
+
+    class Tooltip:
+        """Tk has no tooltips, and these carry the honest caveats."""
+
+        def __init__(self, widget):
+            self.widget = widget
+            self.text = ""
+            self.justify = "left"
+            self.win = None
+            self.after_id = None
+            widget.bind("<Enter>", self._schedule, add="+")
+            widget.bind("<Leave>", self._hide, add="+")
+            widget.bind("<Button-1>", self._hide, add="+")
+
+        def set(self, text, justify="left"):
+            self.text = text
+            self.justify = justify
+
+        def _schedule(self, _e=None):
+            self._cancel()
+            self.after_id = self.widget.after(450, self._show)
+
+        def _cancel(self):
+            if self.after_id is not None:
+                self.widget.after_cancel(self.after_id)
+                self.after_id = None
+
+        def _show(self):
+            if self.win or not self.text:
+                return
+            self.win = tk.Toplevel(self.widget)
+            self.win.overrideredirect(True)
+            self.win.attributes("-topmost", True)
+            tk.Label(self.win, text=self.text, bg=TK_TILE, fg=TK_FG,
+                     font=(FONT, 8), justify=self.justify, padx=px(8), pady=px(5),
+                     bd=0).pack()
+            self.win.geometry("+%d+%d" % (self.widget.winfo_rootx() + px(12),
+                                          self.widget.winfo_rooty() + px(22)))
+
+        def _hide(self, _e=None):
+            self._cancel()
+            if self.win:
+                self.win.destroy()
+                self.win = None
+
+    class Meter:
+        """A pill-shaped level bar, drawn on a canvas."""
+
+        H = px(9)
+
+        def __init__(self, parent, width, bg):
+            self.width = width
+            self.bg = bg
+            self.canvas = tk.Canvas(parent, width=width, height=self.H, bg=bg,
+                                    highlightthickness=0, bd=0)
+            self.tip = Tooltip(self.canvas)
+            self.set(0.0, TK_NEUTRAL)
+
+        def _pill(self, x0, x1, color):
+            h = self.H
+            if x1 - x0 <= 0:
+                return
+            self.canvas.create_oval(x0, 0, x0 + h, h, fill=color, outline="")
+            if x1 - x0 > h:
+                self.canvas.create_oval(x1 - h, 0, x1, h, fill=color,
+                                        outline="")
+                self.canvas.create_rectangle(x0 + h / 2, 0, x1 - h / 2, h,
+                                             fill=color, outline="")
+
+        def set(self, pct, color):
+            self.canvas.delete("all")
+            self._pill(0, self.width, TK_TRACK)
+            self._pill(0, max(0.0, min(100.0, pct)) / 100.0 * self.width, color)
+
+    class Widget:
+        def __init__(self, root):
+            self.root = root
+            self.stats = {}
+            self.config = load_config()
+            self.lang = self.config.get("lang", default_lang())
+            self.mode = self.config.get("mode", "expanded")
+            self.frames_big = FrameCache(BIG_CELL, TK_CARD)
+            self.frames_mini = FrameCache(MINI_CELL, TK_CARD)
+            self.clawd = ClawdEngine()
+            self.clawd_mini_engine = MiniClawdEngine()
+            self.polling = False
+            self.poll_result = None
+            self.session_active = False
+            self.script_mtime = script_mtime()
+            self.last_seen_mtime = newest_transcript_mtime()
+            self.alerted = {}
+            self.drag_from = None
+
+            root.configure(bg=TK_BG)
+            root.overrideredirect(True)
+            root.attributes("-topmost", True)
+            root.bind("<Escape>", lambda _e: self.quit())
+            root.protocol("WM_DELETE_WINDOW", self.quit)
+
+            self.pages = {}
+            self.build()
+            self.set_mode(self.mode, first=True)
+            self.refresh()
+            # A window has no true size until it is mapped, and a withdrawn
+            # one reports 1x1 - which put the widget's left edge where its
+            # right edge belonged. Map it out of sight, measure, then move it
+            # to where it goes; nothing is ever drawn at the wrong place.
+            root.geometry("+-4000+-4000")
+            root.deiconify()
+            root.update()
+            self.restore_position()
+
+            root.after(REFRESH_SECONDS * 1000, self.tick_refresh)
+            root.after(120, self.animate_big)
+            root.after(350, self.animate_mini)
+            root.after(WATCH_SECONDS * 1000, self.watch)
+            root.after(1000, self.tick_countdown)
+            root.after(USAGE_POLL_SECONDS * 1000, self.tick_usage_poll)
+            self.spawn_usage_poll()
+
+        # ---------------------------------------------------------- chrome
+        def tr(self, key, **kw):
+            text = TR[self.lang][key]
+            return text.format(**kw) if kw else text
+
+        def button(self, parent, text, command):
+            lab = tk.Label(parent, text=text, bg=parent["bg"], fg=TK_MUTED,
+                           font=(FONT, 10), cursor="hand2", padx=px(5))
+            lab.bind("<Button-1>", lambda _e: command())
+            lab.bind("<Enter>", lambda _e: lab.configure(fg=TK_FG))
+            lab.bind("<Leave>", lambda _e: lab.configure(fg=TK_MUTED))
+            self.buttons.add(lab)
+            return lab
+
+        def arm_drag(self, widget):
+            """Anything that is not a control drags the window."""
+            if widget not in self.buttons:
+                widget.bind("<Button-1>", self.on_drag_start, add="+")
+                widget.bind("<B1-Motion>", self.on_drag_move, add="+")
+                widget.bind("<ButtonRelease-1>", self.on_drag_end, add="+")
+            for child in widget.winfo_children():
+                self.arm_drag(child)
+
+        def on_drag_start(self, event):
+            self.drag_from = (event.x_root - self.root.winfo_x(),
+                              event.y_root - self.root.winfo_y())
+
+        def on_drag_move(self, event):
+            if not self.drag_from:
+                return
+            self.root.geometry("+%d+%d" % (event.x_root - self.drag_from[0],
+                                           event.y_root - self.drag_from[1]))
+
+        def on_drag_end(self, _event):
+            if not self.drag_from:
+                return
+            self.drag_from = None
+            # an override-redirect window gets no help from the shell in
+            # remembering where it was, so remember it here
+            self.config = update_config(
+                pos=[self.root.winfo_x(), self.root.winfo_y()])
+
+        def restore_position(self):
+            w = max(self.root.winfo_width(), self.root.winfo_reqwidth())
+            h = max(self.root.winfo_height(), self.root.winfo_reqheight())
+            sw = self.root.winfo_screenwidth()
+            sh = self.root.winfo_screenheight()
+            pos = self.config.get("pos")
+            if not (isinstance(pos, list) and len(pos) == 2):
+                pos = [sw - w - px(40), px(60)]
+            # a monitor that has since been unplugged, or a resolution change,
+            # must not strand the widget off-screen
+            x = max(0, min(int(pos[0]), sw - w))
+            y = max(0, min(int(pos[1]), sh - h))
+            self.root.geometry("+%d+%d" % (x, y))
+
+        def quit(self):
+            self.root.destroy()
+
+        # ----------------------------------------------------------- pages
+        def build(self):
+            for page in self.pages.values():
+                page.destroy()
+            self.pages = {}
+            self.buttons = set()
+            self.rtl = self.lang == "he"
+            self.anchor = "e" if self.rtl else "w"
+            self.build_full()
+            self.build_mini()
+            for page in self.pages.values():
+                self.arm_drag(page)
+
+        def _side(self, primary):
+            """Headers read from the language's own starting edge."""
+            if primary:
+                return "right" if self.rtl else "left"
+            return "left" if self.rtl else "right"
+
+        def build_full(self):
+            card = tk.Frame(self.root, bg=TK_CARD, padx=PAD, pady=PAD)
+            self.pages["expanded"] = card
+
+            header = tk.Frame(card, bg=TK_CARD)
+            header.pack(fill="x")
+            self.title_label = tk.Label(header, text=self.tr("title"),
+                                        bg=TK_CARD, fg=TK_FG,
+                                        font=(FONT, 10, "bold"))
+            self.title_label.pack(side=self._side(True))
+            for text, cmd in (("✕", self.quit),
+                              ("\U0001F5D5", lambda: self.set_mode("mini")),
+                              ("⟳", self.manual_refresh),
+                              (self.tr("toggle"), self.toggle_lang)):
+                self.button(header, text, cmd).pack(side=self._side(False))
+
+            grid = tk.Frame(card, bg=TK_CARD)
+            grid.pack(fill="x", pady=(px(10), 0))
+            self.tiles = {}
+            for i, key in enumerate(STAT_KEYS):
+                col = i % 4
+                # the tiles are a reading order, so mirror them in Hebrew
+                col = 3 - col if self.rtl else col
+                tile = tk.Frame(grid, bg=TK_TILE, padx=px(10), pady=px(7),
+                                width=TILE_W, height=TILE_H)
+                tile.grid(row=i // 4, column=col, padx=(0, TILE_GAP),
+                          pady=(0, TILE_GAP), sticky="nsew")
+                tile.grid_propagate(False)
+                tk.Label(tile, text=self.tr(key), bg=TK_TILE, fg=TK_MUTED,
+                         font=(FONT, 8), anchor=self.anchor).pack(fill="x")
+                val = tk.Label(tile, text="…", bg=TK_TILE, fg=TK_FG,
+                               font=(FONT, 14, "bold"), anchor=self.anchor)
+                val.pack(fill="x")
+                self.tiles[key] = val
+            for c in range(4):
+                grid.grid_columnconfigure(c, weight=1, minsize=TILE_W)
+            for r in range(2):
+                grid.grid_rowconfigure(r, minsize=TILE_H)
+
+            meters = tk.Frame(card, bg=TK_CARD)
+            meters.pack(fill="x", pady=(px(4), 0))
+            self.full_meters = {}
+            half = (CONTENT_W - 12) // 2
+            for i, key in enumerate(("hour5", "week")):
+                col = (1 - i) if self.rtl else i
+                box = tk.Frame(meters, bg=TK_CARD, width=half)
+                box.grid(row=0, column=col, padx=(0, px(12)), sticky="ew")
+                row = tk.Frame(box, bg=TK_CARD)
+                row.pack(fill="x")
+                lab = tk.Label(row, bg=TK_CARD, fg=TK_MUTED, font=(FONT, 8))
+                lab.pack(side=self._side(True))
+                pct = tk.Label(row, bg=TK_CARD, fg=TK_FG,
+                               font=(FONT, 9, "bold"))
+                pct.pack(side=self._side(False))
+                bar = Meter(box, half, TK_CARD)
+                bar.canvas.pack(fill="x", pady=(px(2), 0))
+                self.full_meters[key] = (lab, pct, bar)
+            for c in range(2):
+                meters.grid_columnconfigure(c, weight=1, minsize=half)
+
+            # the heatmap stays chronological left→right in both languages
+            self.heatmap = tk.Canvas(card, width=CONTENT_W,
+                                     height=7 * HEAT_CELL + 6 * HEAT_GAP,
+                                     bg=TK_CARD, highlightthickness=0, bd=0)
+            self.heatmap.pack(pady=(px(12), 0))
+            self.heat_cells = {}
+            for col in range(HEATMAP_WEEKS):
+                for row in range(7):
+                    x = col * (HEAT_CELL + HEAT_GAP)
+                    y = row * (HEAT_CELL + HEAT_GAP)
+                    self.heat_cells[(col, row)] = self.heatmap.create_rectangle(
+                        x, y, x + HEAT_CELL, y + HEAT_CELL,
+                        fill=TK_HEAT[0], outline="")
+
+            self.strip = tk.Canvas(card, width=CONTENT_W, height=STRIP_H,
+                                   bg=TK_CARD, highlightthickness=0, bd=0)
+            self.strip.pack(pady=(px(10), 0))
+            self.clawd_big = self.strip.create_image(
+                10, 2, anchor="nw", image=self.frames_big.get())
+
+            self.footer = tk.Label(card, text="", bg=TK_CARD, fg=TK_MUTED,
+                                   font=(FONT, 8), anchor=self.anchor,
+                                   justify="right" if self.rtl else "left",
+                                   wraplength=CONTENT_W)
+            self.footer.pack(fill="x", pady=(px(8), 0))
+
+        def build_mini(self):
+            card = tk.Frame(self.root, bg=TK_CARD, padx=MINI_PAD, pady=MINI_PAD)
+            self.pages["mini"] = card
+
+            top = tk.Frame(card, bg=TK_CARD)
+            top.pack(fill="x")
+            self.corner = tk.Canvas(top, width=CANVAS_W * MINI_CELL,
+                                    height=CANVAS_H * MINI_CELL + 4,
+                                    bg=TK_CARD, highlightthickness=0, bd=0)
+            self.corner.pack(side=self._side(True))
+            self.clawd_mini = self.corner.create_image(
+                0, 4, anchor="nw", image=self.frames_mini.get())
+            tk.Label(top, text="Claude", bg=TK_CARD, fg=TK_CORAL,
+                     font=(FONT, 11, "bold")).pack(side=self._side(True),
+                                                   padx=(px(6), 0))
+            for text, cmd in (("⤢", lambda: self.set_mode("expanded")),
+                              ("⟳", self.manual_refresh)):
+                self.button(top, text, cmd).pack(side=self._side(False))
+
+            self.mini_meters = {}
+            for key in ("hour5", "week"):
+                row = tk.Frame(card, bg=TK_CARD)
+                row.pack(fill="x", pady=(px(6), 0))
+                lab = tk.Label(row, bg=TK_CARD, fg=TK_MUTED, font=(FONT, 8))
+                lab.pack(side=self._side(True))
+                pct = tk.Label(row, bg=TK_CARD, fg=TK_FG,
+                               font=(FONT, 9, "bold"))
+                pct.pack(side=self._side(False))
+                bar = Meter(card, MINI_W, TK_CARD)
+                bar.canvas.pack(fill="x", pady=(px(2), 0))
+                self.mini_meters[key] = (lab, pct, bar)
+
+        # -------------------------------------------------------- behavior
+        def set_mode(self, mode, first=False):
+            self.mode = mode
+            for name, page in self.pages.items():
+                if name == mode:
+                    page.pack()
+                else:
+                    page.pack_forget()
+            if not first:
+                self.config = update_config(mode=mode)
+            # Let the window shrink back to whichever page is showing. An
+            # empty geometry drops the position along with the size, so put
+            # the widget back where the user left it.
+            x, y = self.root.winfo_x(), self.root.winfo_y()
+            self.root.geometry("")
+            self.root.update_idletasks()
+            if not first:
+                self.root.geometry("+%d+%d" % (x, y))
+
+        def toggle_lang(self):
+            self.lang = "en" if self.lang == "he" else "he"
+            self.config = update_config(lang=self.lang)
+            x, y = self.root.winfo_x(), self.root.winfo_y()
+            # a rebuild is cheaper to get right than re-mirroring every
+            # packed widget in place, and it is instant at this size
+            self.build()
+            self.set_mode(self.mode, first=True)
+            self.refresh()
+            self.root.update_idletasks()
+            self.root.geometry("+%d+%d" % (x, y))
+
+        def manual_refresh(self):
+            self.refresh()
+
+        # ------------------------------------------------------------ data
+        def tick_refresh(self):
+            self.refresh()
+            self.root.after(REFRESH_SECONDS * 1000, self.tick_refresh)
+
+        def watch(self):
+            """Cheap tick: notice live sessions, fresh data and new code."""
+            newest = newest_transcript_mtime()
+            was_active = self.session_active
+            self.session_active = (time.time() - newest) < ACTIVE_WINDOW
+            if self.session_active and newest > self.last_seen_mtime:
+                self.last_seen_mtime = newest
+                self.refresh()
+            elif was_active and not self.session_active:
+                self.refresh()
+            mtime = script_mtime()
+            if mtime and self.script_mtime and mtime != self.script_mtime:
+                restart_process()
+            self.root.after(WATCH_SECONDS * 1000, self.watch)
+
+        def refresh(self):
+            try:
+                self.stats = collect_stats()
+            except Exception as exc:  # keep the widget alive on parse errors
+                self.footer.configure(text=self.tr("err", e=exc))
+                return
+            s = self.stats
+            for key, text in (
+                    ("sessions", str(s["sessions"])),
+                    ("messages", str(s["messages"])),
+                    ("total_tokens", fmt_num(s["total_tokens"])),
+                    ("active_days", str(s["active_days"])),
+                    ("current_streak", f'{s["current_streak"]}d'),
+                    ("longest_streak", f'{s["longest_streak"]}d'),
+                    ("peak_hour", fmt_hour(s["peak_hour"])),
+                    ("favorite_model", s["favorite_model"])):
+                self.tiles[key].configure(text=text)
+            self.footer.configure(text=hp_line(s["total_tokens"], self.lang))
+            self.tick_meters()
+            for title, body, critical in alert_messages(s, self.alerted,
+                                                        self.lang):
+                notify(title, body, critical)
+            self.update_heatmap()
+
+        def spawn_usage_poll(self):
+            """Refresh the real quota off-thread so the UI never stalls."""
+            if self.polling:
+                return
+            self.polling = True
+
+            def work():
+                # Tk is single-threaded: hand the answer back through an
+                # attribute and let the countdown tick pick it up, rather than
+                # touching widgets from here
+                try:
+                    self.poll_result = poll_usage()
+                finally:
+                    self.polling = False
+
+            threading.Thread(target=work, daemon=True).start()
+
+        def tick_usage_poll(self):
+            self.spawn_usage_poll()
+            self.root.after(USAGE_POLL_SECONDS * 1000, self.tick_usage_poll)
+
+        def tick_countdown(self):
+            if self.poll_result is not None:
+                self.poll_result = None
+                self.refresh()
+            else:
+                self.tick_meters()
+            self.root.after(1000, self.tick_countdown)
+
+        def tick_meters(self):
+            """Second-by-second countdown to each window's reset."""
+            if not self.stats:
+                return
+            now = time.time()
+            for key, win_key in (("hour5", "window_5h"), ("week", "window_7d")):
+                win = self.stats.get(win_key) or {}
+                resets = win.get("resets_at")
+                span = win.get("window_seconds") or 1
+                if resets:
+                    left = max(0, int(resets - now))
+                    elapsed = 100.0 * (1 - left / span)
+                    countdown = fmt_countdown(left, self.lang)
+                else:
+                    # no open window: the session is over, quota is fresh
+                    elapsed, countdown = 100.0, self.tr("fresh")
+                quota = win.get("quota_pct")
+                real_quota = quota is not None
+                if real_quota:
+                    # the honest meter: how much of the quota is gone,
+                    # straight from the server's own answer to /usage
+                    elapsed = float(quota)
+                    text = f"{quota:.0f}%"
+                    tip = TR[self.lang]["tip_quota"].format(
+                        age=win.get("quota_age_min") or 0,
+                        reset=win.get("quota_reset") or "?")
+                    color = ("#e0645c" if elapsed >= 80 else
+                             "#e8a34c" if elapsed >= 50 else "#6fbf73")
+                elif key == "hour5":
+                    text = f"{elapsed:.0f}%"
+                    tip = TR[self.lang]["tip_session"].format(left=countdown)
+                    # time progress stays neutral: a session ending is not a
+                    # danger, and colouring it red would say it was
+                    color = TK_NEUTRAL
+                else:
+                    text = countdown
+                    tip = TR[self.lang]["tip_countdown"]
+                    color = TK_NEUTRAL
+                for meters in (self.full_meters, self.mini_meters):
+                    lab, val, bar = meters[key]
+                    lab.configure(text=self.tr(
+                        f"{key}_short" if meters is self.mini_meters
+                        else (f"{key}_quota" if real_quota
+                              else f"{key}_reset")))
+                    val.configure(text=text)
+                    bar.set(elapsed, color)
+                    bar.tip.set(tip, "right" if self.rtl else "left")
+
+        def update_heatmap(self):
+            activity = {date.fromisoformat(k): v
+                        for k, v in self.stats.get("day_activity", {}).items()}
+            peak = max(activity.values(), default=1) or 1
+            today = date.today()
+            end_week_start = week_start(today)
+            for col in range(HEATMAP_WEEKS):
+                ws = end_week_start - timedelta(weeks=HEATMAP_WEEKS - 1 - col)
+                for row in range(7):
+                    d = ws + timedelta(days=row)
+                    count = activity.get(d, 0) if d <= today else 0
+                    level = 0 if count <= 0 else 1 + min(3, int(3 * count / peak))
+                    self.heatmap.itemconfigure(self.heat_cells[(col, row)],
+                                               fill=TK_HEAT[level])
+
+        # ------------------------------------------------------- animation
+        def animate_big(self):
+            if self.mode == "expanded":
+                kw, x, y = self.clawd.step(
+                    CONTENT_W, BIG_CELL, self.session_active,
+                    self.stats.get("week_quota_pct") or 0)
+                self.strip.itemconfigure(self.clawd_big,
+                                         image=self.frames_big.get(**kw))
+                self.strip.coords(self.clawd_big, x, y)
+            self.root.after(120, self.animate_big)
+
+        def animate_mini(self):
+            if self.mode == "mini":
+                kw, y = self.clawd_mini_engine.step(
+                    self.session_active, self.stats.get("week_quota_pct") or 0)
+                self.corner.itemconfigure(self.clawd_mini,
+                                          image=self.frames_mini.get(**kw))
+                self.corner.coords(self.clawd_mini, 0, y)
+            self.root.after(350, self.animate_mini)
+
+    try:
+        root.iconphoto(True, tk.PhotoImage(file=str(ICON_PATH)))
+    except tk.TclError:
+        pass                # a missing icon must never stop the widget
+    Widget(root)
+    root.focus_force()
+    root.mainloop()
+
+
+def run_gui():
+    """Pick the toolkit that actually exists on this desktop."""
+    if IS_WINDOWS:
+        return run_gui_tk()
+    return run_gui_gtk()
 
 
 if __name__ == "__main__":
