@@ -18,3 +18,8 @@ client_secret*.json
 .idea/
 *.swp
 .DS_Store
+
+# --- סודות: לא נכנסים לגיט (גם בריפו פרטי) ---
+*.p12
+credentials.json
+service-account*.json
