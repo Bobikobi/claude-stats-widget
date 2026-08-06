@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  check:
+    name: ${{ matrix.os }} / py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # the oldest supported interpreter and a current one, on both targets
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.9", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Compile
+        run: python -m py_compile claude-stats-widget
+
+      - name: Lint
+        run: |
+          python -m pip install --quiet ruff
+          # E9 = syntax/IO errors, F = pyflakes (undefined and unused names).
+          # Deliberately not a style gate: this file has a house style.
+          python -m ruff check --select=E9,F --target-version=py39 claude-stats-widget
+
+      - name: Stats collection runs on an empty profile
+        shell: bash
+        run: |
+          python - <<'PY'
+          import importlib.util, json
+          from importlib.machinery import SourceFileLoader
+          loader = SourceFileLoader("csw", "claude-stats-widget")
+          spec = importlib.util.spec_from_loader("csw", loader)
+          m = importlib.util.module_from_spec(spec)
+          loader.exec_module(m)
+
+          # No ~/.claude here, so this also proves the widget survives having
+          # nothing to read rather than only working on a populated machine.
+          stats = m.collect_stats()
+          assert stats["sessions"] == 0, stats
+          assert stats["total_tokens"] == 0, stats
+          json.dumps(stats)
+
+          # the icon encoder must not need any image library
+          png = m.clawd_png(m.icon_grid(), 4)
+          assert png.startswith(b"\x89PNG\r\n\x1a\n"), png[:8]
+
+          # our own polling must never be counted, and real projects must be
+          assert m.is_poll_dir(m.POLL_PROJECT)
+          assert not m.is_poll_dir("home-user-projects-claude-stats-widget")
+          assert m.is_poll_dir("home-user-cache-claude-stats-widget-poll")
+
+          assert m.parse_usage("nothing useful here") is None
+          report = m.parse_usage(
+              "Current session: 42% used (resets 3pm)\n"
+              "Current week (all models): 7% used (resets Sunday)")
+          assert report["session_pct"] == 42, report
+          assert report["week_pct"] == 7, report
+          print("ok")
+          PY
+
+      - name: Icon writes and the GUI imports
+        if: runner.os == 'Windows'
+        run: |
+          python claude-stats-widget --write-icon
+          python -c "import tkinter; print('tkinter', tkinter.TkVersion)"
+
+      - name: Installer parses
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $err = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path .\install.ps1), [ref]$null, [ref]$err) | Out-Null
+          if ($err) { $err | ForEach-Object { $_.Message }; exit 1 }
+          Write-Host "install.ps1 parses clean"
+
+      - name: Installer is executable and shell-clean
+        if: runner.os == 'Linux'
+        run: |
+          test -x install.sh || { echo "install.sh is not executable"; exit 1; }
+          bash -n install.sh
+          # a shell script with CRLF dies on Linux with a baffling error, and
+          # a Windows checkout is enough to introduce it
+          ! grep -qU $'\r' install.sh || { echo "install.sh has CRLF"; exit 1; }
+          ! grep -qU $'\r' claude-stats-widget || { echo "widget has CRLF"; exit 1; }
