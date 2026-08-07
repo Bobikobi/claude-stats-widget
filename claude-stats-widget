@@ -439,6 +439,11 @@ def fmt_num(n):
 USAGE_CACHE = (APP_DIR / "usage.json" if IS_WINDOWS
                else Path.home() / ".cache" / "claude-stats-widget-usage.json")
 USAGE_POLL_SECONDS = 300      # /usage is answered locally and costs nothing
+# How long a cached answer may still be shown as the real quota. Polling fails
+# exactly when you are blocked, so without an expiry the widget freezes on the
+# last thing it saw - 100% - and keeps showing it long after the window reset.
+USAGE_MAX_AGE = 15 * 60
+POLL_LOG = Path.home() / ".cache" / "claude-stats-widget-poll.log"
 # Every `claude -p` call opens a session and writes a transcript. Run the poll
 # from its own directory so those land in one predictable project folder that
 # we can skip while counting and clear afterwards - otherwise the widget ends
@@ -556,6 +561,23 @@ def parse_usage(text):
     return out if "session_pct" in out or "week_pct" in out else None
 
 
+def log_poll_failure(why):
+    """Leave a trace when a poll comes back empty.
+
+    A silent failure is indistinguishable from a quiet week: the number on
+    screen simply stops moving, with nothing anywhere to say why.
+    """
+    line = f"{datetime.now().isoformat(timespec='seconds')} {why}\n"
+    try:
+        with POLL_LOG.open("a", encoding="utf-8") as fh:
+            fh.write(line)
+        if POLL_LOG.stat().st_size > 64_000:
+            POLL_LOG.write_text(
+                POLL_LOG.read_text(encoding="utf-8")[-32_000:], encoding="utf-8")
+    except OSError:
+        pass
+
+
 def poll_usage():
     """Ask Claude Code itself for the quota.
 
@@ -572,17 +594,21 @@ def poll_usage():
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=90, cwd=str(POLL_DIR), **NO_WINDOW)
         data = json.loads(proc.stdout)
-    except Exception:
+    except Exception as exc:
+        log_poll_failure(f"{type(exc).__name__}: {exc}")
         return None
     finally:
         clear_poll_transcripts()
     report = parse_usage(data.get("result") or "")
-    if report:
-        try:
-            USAGE_CACHE.parent.mkdir(parents=True, exist_ok=True)
-            USAGE_CACHE.write_text(json.dumps(report), encoding="utf-8")
-        except OSError:
-            pass
+    if not report:
+        said = str(data.get("result") or proc.stderr or "")[:200]
+        log_poll_failure("no percentages in the answer: " + " ".join(said.split()))
+        return None
+    try:
+        USAGE_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        USAGE_CACHE.write_text(json.dumps(report), encoding="utf-8")
+    except OSError as exc:
+        log_poll_failure(f"could not write the cache: {exc}")
     return report
 
 
@@ -598,10 +624,19 @@ def clear_poll_transcripts():
 
 
 def load_usage_cache():
+    """The last answer /usage gave us, while it can still be true.
+
+    Past USAGE_MAX_AGE we drop it and fall back to the local time-based
+    reading, which is rougher but never claims you are blocked when you
+    are not.
+    """
     try:
-        return json.loads(USAGE_CACHE.read_text(encoding="utf-8"))
+        report = json.loads(USAGE_CACHE.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
+    if time.time() - (report.get("at") or 0) > USAGE_MAX_AGE:
+        return None
+    return report
 
 
 def week_start(today):
