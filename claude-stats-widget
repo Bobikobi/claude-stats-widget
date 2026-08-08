@@ -561,12 +561,24 @@ def parse_usage(text):
     return out if "session_pct" in out or "week_pct" in out else None
 
 
+_last_poll_failure = (None, 0.0)
+
+
 def log_poll_failure(why):
     """Leave a trace when a poll comes back empty.
 
     A silent failure is indistinguishable from a quiet week: the number on
     screen simply stops moving, with nothing anywhere to say why.
+
+    A poll every five minutes would turn one standing problem into 288 lines
+    a day, so the same reason is repeated at most hourly - often enough to
+    show how long it lasted, rarely enough to stay readable.
     """
+    global _last_poll_failure
+    last_why, last_at = _last_poll_failure
+    if why == last_why and time.time() - last_at < 3600:
+        return
+    _last_poll_failure = (why, time.time())
     line = f"{datetime.now().isoformat(timespec='seconds')} {why}\n"
     try:
         with POLL_LOG.open("a", encoding="utf-8") as fh:
@@ -586,7 +598,10 @@ def poll_usage():
     """
     cli = claude_cli()
     if not cli:
-        return None      # no CLI, no real quota — the meters fall back cleanly
+        # no CLI, no real quota — the meters fall back cleanly, but say so:
+        # this is the one failure that never fixes itself on its own
+        log_poll_failure("the claude CLI is not on PATH")
+        return None
     try:
         POLL_DIR.mkdir(parents=True, exist_ok=True)
         proc = subprocess.run(
