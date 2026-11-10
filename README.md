@@ -13,25 +13,7 @@ Runs on **Linux** (GTK3 plus a GNOME Shell extension) and **Windows**
 (Tkinter). A wide, animated Clawd-and-usage strip sits just left of the clock
 in the GNOME panel or next to the Windows taskbar's notification area.
 
-```text
-✳ Claude Code - Usage                        ⟳  🗕  עב  ✕
-
-  Sessions      Messages     Total tokens   Active days
-  5             3233         2.4M           2
-
-  Current streak Longest streak Peak hour    Favorite model
-  2d             2d             11 PM        Opus 5
-
-  Session quota used   50%   ████████░░░░░░░░
-  Week quota used      46%   ███████░░░░░░░░░
-
-  ▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪
-  ▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪   ← 19 weeks of activity
-  ▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪
-
-                 (Clawd walks here)
-  You've used ~15× more tokens than Pride and Prejudice.
-```
+![The widget window: session and weekly quota, activity heatmap, Clawd](docs/screenshot.png)
 
 ## Where the numbers come from
 
