@@ -510,7 +510,8 @@ def default_lang():
 def load_config():
     try:
         with open(CONFIG_PATH, encoding="utf-8") as fh:
-            return json.load(fh)
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
         return {}
 
@@ -518,8 +519,8 @@ def load_config():
 def save_config(cfg):
     try:
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with open(CONFIG_PATH, "w", encoding="utf-8") as fh:
-            json.dump(cfg, fh, ensure_ascii=False)
+        atomic_write(CONFIG_PATH, json.dumps(
+            cfg, ensure_ascii=False).encode("utf-8"))
     except OSError:
         pass
 
@@ -616,6 +617,8 @@ def install_latest_update(target=SCRIPT_PATH, url=UPDATE_URL):
         return False
     if target.read_bytes() == source:
         return False
+    if not auto_update_enabled():
+        return False  # switched off while the download was running
 
     temporary = None
     try:
@@ -2880,8 +2883,6 @@ def run_gui_tk():
                 bg=TK_CARD, fg=TK_MUTED, font=(FONT, 8),
                 anchor=self.anchor, justify="right" if self.rtl else "left")
             self.update_label.pack(fill="x")
-            self.update_label.bind(
-                "<Button-1>", lambda _e: self.toggle_auto_update())
 
         def build_mini(self):
             card = tk.Frame(self.root, bg=TK_CARD, padx=MINI_PAD, pady=MINI_PAD)

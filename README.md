@@ -161,7 +161,7 @@ widgets embedded inside the taskbar.
 
 Auto-update is off by default and the widget makes no update request at all
 until you enable it. Enable it with the "Auto-update" checkbox in the Linux
-window (or the notification-area menu / update line on Windows), or by setting
+window (or the notification-area menu on Windows), or by setting
 `"auto_update": true` in the config file below. When on, installed copies check
 for updates at startup and every six hours.
 
