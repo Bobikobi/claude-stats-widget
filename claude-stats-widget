@@ -11,6 +11,7 @@ remaining-budget meters + Clawd in the corner).
 
 CLI: --json prints the computed stats and exits (for testing/scripting).
 """
+import ast
 import json
 import os
 import random
@@ -18,15 +19,18 @@ import re
 import shutil
 import struct
 import subprocess
+import tempfile
 import threading
 import sys
 import time
+from urllib.request import Request, urlopen
 import zlib
 from collections import Counter
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
 IS_WINDOWS = os.name == "nt"
+APP_VERSION = (1, 1, 0)
 
 SCRIPT_PATH = Path(__file__).resolve()
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
@@ -48,13 +52,23 @@ else:
     ICON_PATH = Path.home() / ".local" / "share" / "icons" / "claude-clawd.png"
     ICO_PATH = None
 
+PANEL_ICON_DIR = APP_DIR / "panel-icons"
+PANEL_STATE_PATH = APP_DIR / "panel-state.json"
+PANEL_COMMAND_PATH = APP_DIR / "panel-command"
+
 REFRESH_SECONDS = 30
 WATCH_SECONDS = 5      # live-session / self-update poll
+UPDATE_CHECK_SECONDS = 6 * 60 * 60
+UPDATE_TIMEOUT_SECONDS = 10
+UPDATE_MAX_BYTES = 2 * 1024 * 1024
+UPDATE_URL = ("https://raw.githubusercontent.com/Bobikobi/"
+              "claude-stats-widget/main/claude-stats-widget")
 ACTIVE_WINDOW = 90     # a transcript touched this recently means "in a session"
 HEATMAP_WEEKS = 19      # weeks across, matching the app's own grid
 # Pride and Prejudice ≈ 122k words ≈ 162.5k tokens — the app's own yardstick
 HP_TOKENS = 162_500
 MODEL_NAMES = {
+    "claude-fable-5-2": "Fable 5.2",
     "claude-fable-5-1": "Fable 5.1",
     "claude-fable-5": "Fable 5",
     "claude-opus-5-5": "Opus 5.5",
@@ -94,6 +108,17 @@ TR = {
         "tip_countdown": "הזמן שנותר עד שחלון השימוש נפתח מחדש.",
         "hour5_short": "5 שעות",
         "week_short": "7 ימים",
+        "tray_title": "Claude Stats",
+        "tray_time_estimate": "התקדמות בזמן, לא ניצול מכסה",
+        "tray_resets_in": "מתאפס בעוד",
+        "tray_show_hour5": "הצג מכסה ל-5 שעות",
+        "tray_show_week": "הצג מכסה שבועית",
+        "tray_open": "פתח את הווידג׳ט",
+        "tray_quit": "יציאה",
+        "update_checking": "בודק עדכונים…",
+        "update_current": "",
+        "update_restarting": "העדכון הותקן; מרענן…",
+        "update_error": "עדכון אוטומטי נכשל: {error}",
     },
     "en": {
         "title": "✳ Claude Code - Usage",
@@ -123,6 +148,17 @@ TR = {
         "tip_countdown": "Time left until this usage window opens up again.",
         "hour5_short": "5h",
         "week_short": "7d",
+        "tray_title": "Claude Stats",
+        "tray_time_estimate": "time progress, not quota use",
+        "tray_resets_in": "resets in",
+        "tray_show_hour5": "Show 5-hour quota",
+        "tray_show_week": "Show weekly quota",
+        "tray_open": "Open widget",
+        "tray_quit": "Quit",
+        "update_checking": "Checking for updates…",
+        "update_current": "",
+        "update_restarting": "Update installed; reloading…",
+        "update_error": "Automatic update failed: {error}",
     },
 }
 
@@ -156,6 +192,7 @@ CLAWD_COLORS = {
     "P": "#8a8780", "F": "#e88a6a", "L": "#4a4a47", "S": "#5b8dd9",
     "T": "#8fb8f0",  # lit screen
     "1": "#D97757", "2": "#6fbf73", "3": "#e8a34c", "4": "#4f78ff",
+    "5": "#e0645c",
 }
 # first column of each 2x2 eye, per gaze direction
 EYE_POS = {"open": (3, 9), "left": (2, 8), "right": (4, 10)}
@@ -289,9 +326,10 @@ def clawd_png(grid, cell):
             + _png_chunk(b"IEND", b""))
 
 
-def icon_grid():
+def icon_grid(frame=None):
     """Clawd's face, cropped out of the animation canvas' empty margin."""
-    return [row[3:19] for row in clawd_grid("idle", "open")[3:]]
+    frame = frame or clawd_grid("idle", "open")
+    return [row[3:19] for row in frame[3:]]
 
 
 def write_icon():
@@ -328,6 +366,120 @@ def clawd_svg(grid, cell):
                              f'width="{cell}" height="{cell}" fill="{color}"/>')
     parts.append("</svg>")
     return "".join(parts).encode()
+
+
+def tray_icon_grid(frame, hour5_pct):
+    """Fit Clawd and a vertical hourly meter side-by-side in a 16px icon."""
+    pct = max(0, min(100, int(round(hour5_pct))))
+    color = "5" if pct >= 80 else "3" if pct >= 50 else "2"
+    filled = round(16 * pct / 100)
+    rows = []
+    for y in range(16):
+        source_y = min(CANVAS_H - 1, y * CANVAS_H // 16)
+        character = "".join(
+            frame[source_y][x * CANVAS_W // 14] for x in range(14))
+        meter = color if y >= 16 - filled else "L"
+        rows.append(character + "L" + meter)
+    return rows
+
+
+def tray_tooltip(stats, lang, config, now_ts=None):
+    """Build the truthful quota summary shown by the native tray tooltip."""
+    t = TR[lang]
+    lines = [t["tray_title"]]
+    now_ts = time.time() if now_ts is None else now_ts
+    for key, win_key, config_key in (
+            ("hour5", "window_5h", "tray_show_hour5"),
+            ("week", "window_7d", "tray_show_week")):
+        if config.get(config_key) is False:
+            continue
+        win = stats.get(win_key) or {}
+        quota = win.get("quota_pct")
+        if quota is not None:
+            value = f"{float(quota):.0f}%"
+        else:
+            resets = win.get("resets_at")
+            span = win.get("window_seconds") or 1
+            left = max(0, int(resets - now_ts)) if resets else 0
+            elapsed = 100.0 * (1 - left / span) if resets else 100.0
+            if key == "hour5":
+                value = (f"{elapsed:.0f}% "
+                         f"({t['tray_time_estimate']})")
+            else:
+                countdown = fmt_countdown(left, lang) if resets else t["fresh"]
+                value = f"{t['tray_resets_in']} {countdown}"
+        lines.append(f"{t[f'{key}_short']}: {value}")
+    return "\n".join(lines)
+
+
+def panel_state(stats, lang, config, icon_name, now_ts=None):
+    hourly = usage_progress(stats, "hour5", now_ts)
+    weekly = usage_progress(stats, "week", now_ts)
+    window = stats.get("window_5h") or {}
+    week_window = stats.get("window_7d") or {}
+    real_quota = window.get("quota_pct") is not None
+    week_real_quota = week_window.get("quota_pct") is not None
+    details = tray_tooltip(stats, lang, config, now_ts).splitlines()[1:]
+    return {
+        "icon": icon_name,
+        "hour5_pct": hourly,
+        "hour5_text": f"{hourly:.0f}%",
+        "hour5_label": TR[lang]["hour5_short"],
+        "hour5_is_quota": real_quota,
+        "week_pct": weekly,
+        "week_text": f"{weekly:.0f}%",
+        "week_label": TR[lang]["week_short"],
+        "week_is_quota": week_real_quota,
+        "hour5_menu_label": TR[lang]["tray_show_hour5"],
+        "week_menu_label": TR[lang]["tray_show_week"],
+        "open_label": TR[lang]["tray_open"],
+        "quit_label": TR[lang]["tray_quit"],
+        "tooltip": "\n".join(details),
+        "show_hour5": config.get("tray_show_hour5") is not False,
+        "show_week": config.get("tray_show_week") is not False,
+        "lang": lang,
+    }
+
+
+def usage_progress(stats, key, now_ts=None):
+    """Return real quota use when available, otherwise elapsed window time."""
+    win_key = "window_5h" if key == "hour5" else "window_7d"
+    win = stats.get(win_key) or {}
+    quota = win.get("quota_pct")
+    if quota is not None:
+        return max(0.0, min(100.0, float(quota)))
+    resets = win.get("resets_at")
+    if not resets:
+        return 100.0
+    left = max(0, int(resets - (time.time() if now_ts is None else now_ts)))
+    span = win.get("window_seconds") or 1
+    return max(0.0, min(100.0, 100.0 * (1 - left / span)))
+
+
+def atomic_write(path, content):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                mode="wb", dir=str(path.parent), prefix=path.name + ".",
+                delete=False) as output:
+            temporary = Path(output.name)
+            output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def write_panel_state(stats, lang, config, icon_name):
+    state = panel_state(stats, lang, config, icon_name)
+    atomic_write(PANEL_STATE_PATH, json.dumps(
+        state, ensure_ascii=False).encode("utf-8"))
 
 
 # ------------------------------------------------------------------ config
@@ -416,8 +568,162 @@ def restart_process():
         subprocess.Popen([sys.executable, str(SCRIPT_PATH)],
                          close_fds=True, **NO_WINDOW)
         os._exit(0)
-    os.execv(sys.executable, [sys.executable, str(SCRIPT_PATH)])
+    env = os.environ.copy()
+    if "SNAP" in env:
+        for key in tuple(env):
+            if key.startswith("SNAP") or key in (
+                    "GTK_PATH", "GTK_EXE_PREFIX", "GTK_IM_MODULE_FILE",
+                    "GSETTINGS_SCHEMA_DIR"):
+                env.pop(key, None)
+    subprocess.Popen([sys.executable, str(SCRIPT_PATH)], close_fds=True,
+                     env=env)
+    os._exit(0)
+
+
+def is_managed_install():
+    """Avoid replacing a source checkout; only installed copies auto-update."""
+    if IS_WINDOWS:
+        expected = (_LOCALAPPDATA / "Programs" / "claude-stats-widget"
+                    / "claude-stats-widget.pyw")
+    else:
+        bin_dir = Path(os.environ.get("XDG_BIN_HOME")
+                       or Path.home() / ".local" / "bin")
+        expected = bin_dir / "claude-stats-widget"
+    return SCRIPT_PATH == expected.resolve()
+
+
+def install_latest_update(target=SCRIPT_PATH, url=UPDATE_URL):
+    """Download, validate, and atomically install the published widget."""
+    request = Request(url, headers={"User-Agent": "Claude-Stats-Widget"})
+    with urlopen(request, timeout=UPDATE_TIMEOUT_SECONDS) as response:
+        source = response.read(UPDATE_MAX_BYTES + 1)
+    if len(source) > UPDATE_MAX_BYTES:
+        raise ValueError("the downloaded update is unexpectedly large")
+    text = source.decode("utf-8")
+    compile(text, str(target), "exec")
+    candidate_version = source_version(text)
+    try:
+        current_version = source_version(target.read_text(encoding="utf-8"))
+    except ValueError:
+        current_version = (0, 0, 0)
+    if candidate_version <= current_version:
+        return False
+    if target.read_bytes() == source:
+        return False
+
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                mode="wb", dir=str(target.parent),
+                prefix=target.name + ".", suffix=".update",
+                delete=False) as output:
+            temporary = Path(output.name)
+            output.write(source)
+            output.flush()
+            os.fsync(output.fileno())
+        os.chmod(temporary, target.stat().st_mode & 0o777)
+        os.replace(temporary, target)
+        return True
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def install_latest_gnome_extension():
+    """Keep installed GNOME panel assets in sync with the published widget."""
+    if IS_WINDOWS:
+        return False
+    extension_id = "claude-stats-widget@bobikobi"
+    extension_dir = (Path(os.environ.get("XDG_DATA_HOME")
+                          or Path.home() / ".local" / "share")
+                     / "gnome-shell" / "extensions" / extension_id)
+    if not extension_dir.is_dir():
+        return False
+
+    base_url = UPDATE_URL.rsplit("/", 1)[0] + "/gnome-extension/"
+    files = ("extension.js", "metadata.json")
+    downloaded = {}
+    for name in files:
+        request = Request(base_url + name,
+                          headers={"User-Agent": "Claude-Stats-Widget"})
+        with urlopen(request, timeout=UPDATE_TIMEOUT_SECONDS) as response:
+            content = response.read(256 * 1024 + 1)
+        if len(content) > 256 * 1024:
+            raise ValueError(f"the GNOME extension file {name} is too large")
+        downloaded[name] = content
+
+    metadata = json.loads(downloaded["metadata.json"].decode("utf-8"))
+    if metadata.get("uuid") != extension_id:
+        raise ValueError("the downloaded GNOME extension has the wrong UUID")
+    changed = any(
+        not (extension_dir / name).is_file()
+        or (extension_dir / name).read_bytes() != content
+        for name, content in downloaded.items())
+    if not changed:
+        return False
+
+    for name, content in downloaded.items():
+        atomic_write(extension_dir / name, content)
+    stale_stylesheet = extension_dir / "stylesheet.css"
+    if stale_stylesheet.exists():
+        stale_stylesheet.unlink()
+
+    if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+        command = shutil.which("gnome-extensions")
+        if not command:
+            raise RuntimeError(
+                "updated the GNOME extension files but gnome-extensions "
+                "is unavailable; sign out and back in to reload it")
+        subprocess.run(
+            [command, "disable", extension_id],
+            capture_output=True, text=True, timeout=UPDATE_TIMEOUT_SECONDS)
+        result = subprocess.run(
+            [command, "enable", extension_id],
+            capture_output=True, text=True, timeout=UPDATE_TIMEOUT_SECONDS)
+        if result.returncode:
+            details = (result.stderr or result.stdout).strip()
+            raise RuntimeError(
+                "updated the GNOME extension files but could not reload "
+                f"the extension: {details or result.returncode}")
     return True
+
+
+def source_version(source):
+    """Read the three-integer app version without executing downloaded code."""
+    module = ast.parse(source)
+    for node in module.body:
+        if isinstance(node, ast.Assign) and any(
+                isinstance(name, ast.Name) and name.id == "APP_VERSION"
+                for name in node.targets):
+            version = ast.literal_eval(node.value)
+            if (isinstance(version, tuple) and len(version) == 3
+                    and all(type(part) is int and part >= 0
+                            for part in version)):
+                return version
+            break
+    raise ValueError("the update has no valid APP_VERSION")
+
+
+def log_update_failure(error):
+    log_path = APP_DIR / "update.log"
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as log:
+            log.write(f"{datetime.now().astimezone().isoformat()} {error}\n")
+    except OSError as log_error:
+        return f"{error} (also could not write {log_path}: {log_error})"
+    return str(error)
+
+
+def update_status_text(lang, state, error=None):
+    if state == "error":
+        return TR[lang]["update_error"].format(error=error)
+    if state:
+        return TR[lang][f"update_{state}"]
+    return ""
 
 
 # ------------------------------------------------------------------- stats
@@ -682,6 +988,112 @@ def block_reset(timeline, seconds, now_ts):
     return reset if reset > now_ts else None
 
 
+# One entry per transcript, so a refresh reads only what was appended since the
+# last one. The transcripts run to gigabytes; reading them all on every change
+# pinned a core and froze the window (2026-11-10).
+_SCAN_CACHE = {}
+_SCAN_LOCK = threading.Lock()
+_SCAN_MARKS = (b'"type":"user"', b'"type":"assistant"')
+
+
+def _new_scan_entry(st):
+    return {"ino": st.st_ino, "offset": 0, "raw_messages": 0, "raw_tokens": 0,
+            "user_msgs": 0, "sessions": set(), "days": Counter(),
+            "hours": Counter(), "seen": {}}
+
+
+def _scan_line(entry, line, name):
+    try:
+        obj = json.loads(line.decode("utf-8", errors="replace"))
+    except (json.JSONDecodeError, ValueError):
+        return
+    if not isinstance(obj, dict):
+        return
+    typ = obj.get("type")
+    if typ not in ("user", "assistant"):
+        return
+    entry["raw_messages"] += 1
+    if typ == "assistant":
+        _u = (obj.get("message") or {}).get("usage") or {}
+        entry["raw_tokens"] += (_u.get("input_tokens", 0) or 0) + \
+                               (_u.get("output_tokens", 0) or 0)
+    if obj.get("isMeta"):
+        return
+    ts = obj.get("timestamp")
+    try:
+        when = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone()
+    except (AttributeError, ValueError):
+        return
+    msg = obj.get("message") or {}
+
+    if typ == "user":
+        content = msg.get("content")
+        # skip tool results and local-command wrappers
+        if isinstance(content, list):
+            if any(isinstance(c, dict) and c.get("type") == "tool_result" for c in content):
+                return
+            content = " ".join(
+                c.get("text", "") for c in content if isinstance(c, dict)
+            )
+        if not isinstance(content, str) or content.lstrip().startswith("<"):
+            return
+        entry["user_msgs"] += 1
+        sid = obj.get("sessionId")
+        if sid:
+            entry["sessions"].add(sid)
+        entry["days"][when.date()] += 1
+        entry["hours"][when.hour] += 1
+    else:
+        mid = msg.get("id")
+        usage = msg.get("usage") or {}
+        # matches the app's "Total tokens": input + output,
+        # cache reads/writes excluded
+        tokens = (
+            (usage.get("input_tokens", 0) or 0)
+            + (usage.get("output_tokens", 0) or 0)
+        )
+        model = msg.get("model")
+        seen = entry["seen"]
+        if mid:
+            # streaming writes the same message id repeatedly;
+            # keep the largest usage snapshot
+            prev = seen.get(mid)
+            if prev is None or tokens > prev[0]:
+                seen[mid] = (tokens, model, when)
+        else:
+            seen[f"{name}:{when.timestamp()}"] = (tokens, model, when)
+
+
+def _scan_transcripts():
+    """Bring _SCAN_CACHE up to date; call with _SCAN_LOCK held."""
+    live = set()
+    for jf in PROJECTS_DIR.glob("*/*.jsonl"):
+        if is_poll_dir(jf.parent.name):
+            continue        # our own /usage polls, not real sessions
+        key = str(jf)
+        try:
+            st = jf.stat()
+            entry = _SCAN_CACHE.get(key)
+            if (entry is None or entry["ino"] != st.st_ino
+                    or st.st_size < entry["offset"]):
+                entry = _new_scan_entry(st)     # new, replaced or truncated
+            live.add(key)
+            if st.st_size > entry["offset"]:
+                with open(jf, "rb") as fh:
+                    fh.seek(entry["offset"])
+                    for line in fh:
+                        if not line.endswith(b"\n"):
+                            break       # a line still being written
+                        entry["offset"] += len(line)
+                        if (_SCAN_MARKS[0] in line or _SCAN_MARKS[1] in line):
+                            _scan_line(entry, line, jf.name)
+            _SCAN_CACHE[key] = entry
+        except OSError:
+            continue
+    for key in set(_SCAN_CACHE) - live:
+        del _SCAN_CACHE[key]
+
+
 def collect_stats():
     sessions = set()
     raw_messages = 0      # every user/assistant entry, exactly as the app counts
@@ -692,71 +1104,19 @@ def collect_stats():
     hour_counter = Counter()
     model_counter = Counter()
 
-    for jf in PROJECTS_DIR.glob("*/*.jsonl"):
-        if is_poll_dir(jf.parent.name):
-            continue        # our own /usage polls, not real sessions
-        try:
-            with open(jf, encoding="utf-8", errors="replace") as fh:
-                for line in fh:
-                    try:
-                        obj = json.loads(line)
-                    except (json.JSONDecodeError, ValueError):
-                        continue
-                    typ = obj.get("type")
-                    if typ not in ("user", "assistant"):
-                        continue
-                    raw_messages += 1
-                    if typ == "assistant":
-                        _u = (obj.get("message") or {}).get("usage") or {}
-                        raw_tokens += (_u.get("input_tokens", 0) or 0) + \
-                                      (_u.get("output_tokens", 0) or 0)
-                    if obj.get("isMeta"):
-                        continue
-                    ts = obj.get("timestamp")
-                    try:
-                        when = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone()
-                    except (AttributeError, ValueError):
-                        continue
-                    msg = obj.get("message") or {}
-
-                    if typ == "user":
-                        content = msg.get("content")
-                        # skip tool results and local-command wrappers
-                        if isinstance(content, list):
-                            if any(isinstance(c, dict) and c.get("type") == "tool_result" for c in content):
-                                continue
-                            content = " ".join(
-                                c.get("text", "") for c in content if isinstance(c, dict)
-                            )
-                        if not isinstance(content, str) or content.lstrip().startswith("<"):
-                            continue
-                        user_msgs += 1
-                        sid = obj.get("sessionId")
-                        if sid:
-                            sessions.add(sid)
-                        day_activity[when.date()] += 1
-                        hour_counter[when.hour] += 1
-                    else:
-                        mid = msg.get("id")
-                        usage = msg.get("usage") or {}
-                        # matches the app's "Total tokens": input + output,
-                        # cache reads/writes excluded
-                        tokens = (
-                            usage.get("input_tokens", 0)
-                            + usage.get("output_tokens", 0)
-                        )
-                        model = msg.get("model")
-                        if mid:
-                            # streaming writes the same message id repeatedly;
-                            # keep the largest usage snapshot
-                            prev = assistant_seen.get(mid)
-                            if prev is None or tokens > prev[0]:
-                                assistant_seen[mid] = (tokens, model, when)
-                        else:
-                            assistant_seen[f"{jf.name}:{when.timestamp()}"] = (
-                                tokens, model, when)
-        except OSError:
-            continue
+    with _SCAN_LOCK:
+        _scan_transcripts()
+        for entry in _SCAN_CACHE.values():
+            raw_messages += entry["raw_messages"]
+            raw_tokens += entry["raw_tokens"]
+            user_msgs += entry["user_msgs"]
+            sessions |= entry["sessions"]
+            day_activity.update(entry["days"])
+            hour_counter.update(entry["hours"])
+            for mid, snap in entry["seen"].items():
+                prev = assistant_seen.get(mid)
+                if prev is None or snap[0] > prev[0]:
+                    assistant_seen[mid] = snap
 
     total_tokens = 0
     assistant_msgs = 0
@@ -1042,6 +1402,13 @@ class MiniClawdEngine:
 # ---------------------------------------------------------------- GTK widget
 
 def run_gui_gtk():
+    if "SNAP" in os.environ:
+        for key in tuple(os.environ):
+            if key.startswith("SNAP") or key in (
+                    "GTK_PATH", "GTK_EXE_PREFIX", "GTK_IM_MODULE_FILE",
+                    "GSETTINGS_SCHEMA_DIR"):
+                os.environ.pop(key, None)
+
     import gi
 
     gi.require_version("Gtk", "3.0")
@@ -1143,7 +1510,21 @@ def run_gui_gtk():
 
             self.clawd = ClawdEngine()
             self.clawd_mini_engine = MiniClawdEngine()
+            self.panel_clawd_engine = MiniClawdEngine()
+            self.panel_icon_dir = PANEL_ICON_DIR
+            self.panel_icon_dir.mkdir(parents=True, exist_ok=True)
+            self.panel_icon_names = [
+                f"clawd-{slot}.png" for slot in range(8)]
+            self.panel_icon_slot = 0
+            self.panel_state_write_error = False
+            (self.panel_icon_dir / self.panel_icon_names[0]).write_bytes(
+                clawd_png(icon_grid(clawd_grid()), 2))
+            self.update_state = ""
+            self.update_error = None
+            self.update_checking = False
             self.polling = False
+            self.collecting = False
+            self.collect_again = False
             self.session_active = False
             self.script_mtime = script_mtime()
             self.last_seen_mtime = newest_transcript_mtime()
@@ -1155,9 +1536,15 @@ def run_gui_gtk():
             GLib.timeout_add_seconds(REFRESH_SECONDS, self.refresh)
             GLib.timeout_add(120, self.animate_big)
             GLib.timeout_add(350, self.animate_mini)
+            GLib.timeout_add(350, self.animate_tray)
             GLib.timeout_add_seconds(WATCH_SECONDS, self.watch)
             GLib.timeout_add_seconds(1, self.tick_countdown)
             GLib.timeout_add_seconds(USAGE_POLL_SECONDS, self.spawn_usage_poll)
+            GLib.timeout_add(250, self.check_panel_command)
+            if is_managed_install():
+                self.check_for_updates()
+                GLib.timeout_add_seconds(
+                    UPDATE_CHECK_SECONDS, self.check_for_updates)
             self.spawn_usage_poll()
 
         # ---------------------------------------------------------- pages
@@ -1195,7 +1582,7 @@ def run_gui_gtk():
             close = Gtk.Button(label="✕")
             close.get_style_context().add_class("headerbtn")
             close.set_relief(Gtk.ReliefStyle.NONE)
-            close.connect("clicked", lambda *_: Gtk.main_quit())
+            close.connect("clicked", lambda *_: self.close_widget())
             header.pack_end(close, False, False, 0)
             outer.pack_start(header, False, False, 0)
 
@@ -1277,6 +1664,11 @@ def run_gui_gtk():
             self.footer.set_line_wrap(True)
             outer.pack_start(self.footer, False, False, 0)
 
+            self.update_label = Gtk.Label()
+            self.update_label.get_style_context().add_class("footer")
+            self.update_label.set_halign(Gtk.Align.START)
+            outer.pack_start(self.update_label, False, False, 0)
+
             self.stack.add_named(outer, "expanded")
 
         def build_mini(self):
@@ -1356,6 +1748,8 @@ def run_gui_gtk():
                 pass
             if self.stats:
                 self.footer.set_text(hp_line(self.stats["total_tokens"], self.lang))
+            self.render_update_status()
+            self.publish_panel_state()
 
         def on_manual_refresh(self, btn):
             btn.set_sensitive(False)
@@ -1378,8 +1772,63 @@ def run_gui_gtk():
 
         def on_key(self, _w, event):
             if event.keyval == Gdk.KEY_Escape:
-                Gtk.main_quit()
+                self.close_widget()
             return False
+
+        def publish_panel_state(self):
+            if not self.stats:
+                return
+            icon_name = self.panel_icon_names[self.panel_icon_slot]
+            try:
+                write_panel_state(
+                    self.stats, self.lang, self.config, icon_name)
+                self.panel_state_write_error = False
+            except OSError as exc:
+                if not self.panel_state_write_error:
+                    log_update_failure(f"Could not write GNOME panel state: {exc}")
+                    self.panel_state_write_error = True
+
+        def open_from_tray(self, *_args):
+            self.show_all()
+            self.stack.set_visible_child_name(self.mode)
+            self.present()
+
+        def close_widget(self):
+            self.hide()
+
+        def quit_from_tray(self, *_args):
+            Gtk.main_quit()
+
+        def check_panel_command(self):
+            try:
+                command = json.loads(PANEL_COMMAND_PATH.read_text(
+                    encoding="utf-8"))
+            except FileNotFoundError:
+                return True
+            except (OSError, ValueError) as exc:
+                log_update_failure(f"Invalid panel command: {exc}")
+                try:
+                    PANEL_COMMAND_PATH.unlink()
+                except OSError:
+                    pass
+                return True
+            try:
+                PANEL_COMMAND_PATH.unlink()
+            except FileNotFoundError:
+                pass
+            action = command.get("action")
+            if action == "open":
+                self.open_from_tray()
+            elif action == "quit":
+                self.quit_from_tray()
+            elif (action == "set"
+                  and command.get("key") in
+                  ("tray_show_hour5", "tray_show_week")
+                  and isinstance(command.get("value"), bool)):
+                self.config = update_config(**{
+                    command["key"]: command["value"]})
+                self.publish_panel_state()
+            return True
 
         # --------------------------------------------------------- data
         def watch(self):
@@ -1402,12 +1851,71 @@ def run_gui_gtk():
         def restart(self):
             restart_process()
 
-        def refresh(self):
-            try:
-                self.stats = collect_stats()
-            except Exception as exc:  # keep the widget alive on parse errors
-                self.footer.set_text(TR[self.lang]["err"].format(e=exc))
+        def render_update_status(self):
+            self.update_label.set_text(
+                update_status_text(
+                    self.lang, self.update_state, self.update_error))
+
+        def check_for_updates(self):
+            if self.update_checking:
                 return True
+            self.update_checking = True
+            self.update_state, self.update_error = "checking", None
+            self.render_update_status()
+
+            def work():
+                try:
+                    changed = install_latest_update()
+                    panel_changed = (
+                        install_latest_gnome_extension() if changed else False)
+                    state, error = (
+                        ("restarting", None)
+                        if changed or panel_changed else ("current", None))
+                except Exception as exc:
+                    state = "error"
+                    error = log_update_failure(exc)
+                GLib.idle_add(self.finish_update_check, state, error)
+
+            threading.Thread(target=work, daemon=True).start()
+            return True
+
+        def finish_update_check(self, state, error):
+            self.update_checking = False
+            self.update_state, self.update_error = state, error
+            self.render_update_status()
+            return False
+
+        def refresh(self):
+            """Collect off the main thread: the first scan of a large history
+            takes long enough for the shell to call the window frozen."""
+            if self.collecting:
+                self.collect_again = True
+                return True
+            self.collecting = True
+
+            def work():
+                try:
+                    result = collect_stats()
+                except Exception as exc:  # keep the widget alive on parse errors
+                    result = exc
+                GLib.idle_add(self.finish_refresh, result)
+
+            threading.Thread(target=work, daemon=True).start()
+            return True  # keep the GLib timer running
+
+        def finish_refresh(self, result):
+            self.collecting = False
+            if self.collect_again:
+                self.collect_again = False
+                self.refresh()
+            if isinstance(result, Exception):
+                self.footer.set_text(TR[self.lang]["err"].format(e=result))
+                return False
+            self.stats = result
+            self.show_stats()
+            return False
+
+        def show_stats(self):
             s = self.stats
             self.tiles["sessions"].set_text(str(s["sessions"]))
             self.tiles["messages"].set_text(str(s["messages"]))
@@ -1421,7 +1929,7 @@ def run_gui_gtk():
             self.tick_countdown()
             self.check_alerts(s)
             self.update_heatmap()
-            return True  # keep the GLib timer running
+            self.publish_panel_state()
 
         def spawn_usage_poll(self):
             """Refresh the real quota off-thread so the UI never stalls."""
@@ -1488,6 +1996,7 @@ def run_gui_gtk():
                     # neutral, because a session ending is not a danger
                     (ctx.remove_class if real_quota else ctx.add_class)("recordbar")
                     bar.set_tooltip_text(tip)
+            self.publish_panel_state()
             return True
 
         def meter_tooltip(self, key, s):
@@ -1551,6 +2060,24 @@ def run_gui_gtk():
                 self.session_active, self.stats.get("week_quota_pct") or 0)
             self.clawd_mini.set_from_pixbuf(self.frames_mini.get(**kw))
             self.clawd_mini.get_parent().move(self.clawd_mini, 0, y)
+            return True
+
+        def animate_tray(self):
+            kw, _y = self.panel_clawd_engine.step(
+                self.session_active, self.stats.get("week_quota_pct") or 0)
+            self.panel_icon_slot = (
+                self.panel_icon_slot + 1) % len(self.panel_icon_names)
+            name = self.panel_icon_names[self.panel_icon_slot]
+            try:
+                atomic_write(
+                    self.panel_icon_dir / name,
+                    clawd_png(icon_grid(clawd_grid(**kw)), 2))
+            except OSError as exc:
+                if not self.panel_state_write_error:
+                    log_update_failure(f"Could not write GNOME panel icon: {exc}")
+                    self.panel_state_write_error = True
+                return True
+            self.publish_panel_state()
             return True
 
 
@@ -1736,6 +2263,334 @@ def run_gui_tk():
             self._pill(0, self.width, TK_TRACK)
             self._pill(0, max(0.0, min(100.0, pct)) / 100.0 * self.width, color)
 
+    class WindowsTray:
+        """Native notification-area icon and menu, using only Win32 APIs."""
+
+        CALLBACK_MESSAGE = 0x8001
+        CMD_HOUR, CMD_WEEK, CMD_OPEN, CMD_QUIT = range(1, 5)
+
+        def __init__(self, window, widget):
+            import ctypes
+            from ctypes import wintypes
+
+            self.ctypes = ctypes
+            self.wintypes = wintypes
+            self.widget = widget
+            self.user32 = ctypes.windll.user32
+            self.shell32 = ctypes.windll.shell32
+            self.icon_path = APP_DIR / "tray-icon.ico"
+            APP_DIR.mkdir(parents=True, exist_ok=True)
+
+            class NotifyIconData(ctypes.Structure):
+                _fields_ = [
+                    ("cbSize", wintypes.DWORD),
+                    ("hWnd", wintypes.HWND),
+                    ("uID", wintypes.UINT),
+                    ("uFlags", wintypes.UINT),
+                    ("uCallbackMessage", wintypes.UINT),
+                    ("hIcon", wintypes.HICON),
+                    ("szTip", wintypes.WCHAR * 128),
+                    ("dwState", wintypes.DWORD),
+                    ("dwStateMask", wintypes.DWORD),
+                    ("szInfo", wintypes.WCHAR * 256),
+                    ("uTimeoutOrVersion", wintypes.UINT),
+                    ("szInfoTitle", wintypes.WCHAR * 64),
+                    ("dwInfoFlags", wintypes.DWORD),
+                    ("guidItem", ctypes.c_byte * 16),
+                    ("hBalloonIcon", wintypes.HICON),
+                ]
+
+            self.NotifyIconData = NotifyIconData
+            self.nid = NotifyIconData()
+            self.nid.cbSize = ctypes.sizeof(NotifyIconData)
+            self.nid.hWnd = window.winfo_id()
+            self.nid.uID = 1
+            self.nid.uFlags = 0x1 | 0x2 | 0x4
+            self.nid.uCallbackMessage = self.CALLBACK_MESSAGE
+            self.icon_handle = None
+
+            self.shell32.Shell_NotifyIconW.argtypes = [
+                wintypes.DWORD, ctypes.POINTER(NotifyIconData)]
+            self.shell32.Shell_NotifyIconW.restype = wintypes.BOOL
+            self.user32.LoadImageW.argtypes = [
+                wintypes.HINSTANCE, wintypes.LPCWSTR, wintypes.UINT,
+                ctypes.c_int, ctypes.c_int, wintypes.UINT]
+            self.user32.LoadImageW.restype = wintypes.HANDLE
+            self.user32.DestroyIcon.argtypes = [wintypes.HICON]
+            self.user32.CreatePopupMenu.restype = wintypes.HMENU
+            self.user32.DestroyMenu.argtypes = [wintypes.HMENU]
+            self.user32.GetCursorPos.argtypes = [
+                ctypes.POINTER(wintypes.POINT)]
+            self.user32.TrackPopupMenu.argtypes = [
+                wintypes.HMENU, wintypes.UINT, ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, wintypes.HWND, wintypes.HANDLE]
+            self.user32.TrackPopupMenu.restype = wintypes.UINT
+            self.user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+            self.user32.PostMessageW.argtypes = [
+                wintypes.HWND, wintypes.UINT, wintypes.WPARAM,
+                wintypes.LPARAM]
+
+            self.hwnd = window.winfo_id()
+            set_proc = getattr(self.user32, "SetWindowLongPtrW",
+                               self.user32.SetWindowLongW)
+            set_proc.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+            set_proc.restype = ctypes.c_void_p
+            proc_type = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)
+            self.callback = proc_type(
+                ctypes.c_ssize_t, wintypes.HWND, wintypes.UINT,
+                wintypes.WPARAM, wintypes.LPARAM)(self.window_proc)
+            self.old_proc = set_proc(
+                self.hwnd, -4, ctypes.cast(self.callback, ctypes.c_void_p))
+            self.user32.CallWindowProcW.argtypes = [
+                ctypes.c_void_p, wintypes.HWND, wintypes.UINT,
+                wintypes.WPARAM, wintypes.LPARAM]
+            self.user32.CallWindowProcW.restype = ctypes.c_ssize_t
+
+            self.added = False
+            self.set_icon(clawd_grid(), 0)
+            self.set_tooltip()
+            if not self.shell32.Shell_NotifyIconW(0, ctypes.byref(self.nid)):
+                raise OSError(ctypes.get_last_error(),
+                              "Could not add the Claude Stats tray icon")
+            self.added = True
+            self.nid.uTimeoutOrVersion = 4
+            if not self.shell32.Shell_NotifyIconW(
+                    4, ctypes.byref(self.nid)):
+                raise OSError(ctypes.get_last_error(),
+                              "Could not configure the Claude Stats tray icon")
+
+        def set_icon(self, frame, pct):
+            grid = tray_icon_grid(frame, pct)
+            png = clawd_png(grid, 1)
+            header = (struct.pack("<HHH", 0, 1, 1)
+                      + struct.pack("<BBBBHHII", 16, 16, 0, 0, 1, 32,
+                                    len(png), 22))
+            self.icon_path.write_bytes(header + png)
+            handle = self.user32.LoadImageW(
+                None, str(self.icon_path), 1, 0, 0, 0x10 | 0x40)
+            if not handle:
+                raise OSError(self.ctypes.get_last_error(),
+                              "Could not load the Claude Stats tray icon")
+            self.nid.hIcon = handle
+            if self.added and not self.shell32.Shell_NotifyIconW(
+                    1, self.ctypes.byref(self.nid)):
+                self.user32.DestroyIcon(handle)
+                raise OSError(self.ctypes.get_last_error(),
+                              "Could not update the Claude Stats tray icon")
+            if self.icon_handle:
+                self.user32.DestroyIcon(self.icon_handle)
+            self.icon_handle = handle
+
+        def set_tooltip(self):
+            text = tray_tooltip(
+                self.widget.stats, self.widget.lang, self.widget.config)
+            self.nid.szTip = text[:127]
+            if (self.added and not self.shell32.Shell_NotifyIconW(
+                    1, self.ctypes.byref(self.nid))):
+                raise OSError(self.ctypes.get_last_error(),
+                              "Could not update the Claude Stats tray tooltip")
+
+        def window_proc(self, hwnd, message, wparam, lparam):
+            if message == self.CALLBACK_MESSAGE:
+                event = lparam & 0xFFFF
+                if event in (0x0202, 0x0400, 0x0203):
+                    self.widget.open_widget()
+                    return 0
+                if event in (0x0205, 0x007B):
+                    self.show_menu()
+                    return 0
+            return self.user32.CallWindowProcW(
+                self.old_proc, hwnd, message, wparam, lparam)
+
+        def show_menu(self):
+            menu = self.user32.CreatePopupMenu()
+            if not menu:
+                raise OSError(self.ctypes.get_last_error(),
+                              "Could not create the tray menu")
+            try:
+                append = self.user32.AppendMenuW
+                append.argtypes = [self.wintypes.HMENU, self.wintypes.UINT,
+                                   self.wintypes.UINT, self.wintypes.LPCWSTR]
+                append.restype = self.wintypes.BOOL
+                for command, key, label in (
+                        (self.CMD_HOUR, "tray_show_hour5", "tray_show_hour5"),
+                        (self.CMD_WEEK, "tray_show_week", "tray_show_week")):
+                    flags = 0x8 if self.widget.config.get(key) is not False else 0
+                    if not append(menu, flags, command,
+                                  TR[self.widget.lang][label]):
+                        raise OSError(self.ctypes.get_last_error(),
+                                      "Could not add a tray setting")
+                append(menu, 0x800, 0, None)
+                append(menu, 0, self.CMD_OPEN,
+                       TR[self.widget.lang]["tray_open"])
+                append(menu, 0, self.CMD_QUIT,
+                       TR[self.widget.lang]["tray_quit"])
+                point = self.wintypes.POINT()
+                self.user32.GetCursorPos(self.ctypes.byref(point))
+                self.user32.SetForegroundWindow(self.hwnd)
+                command = self.user32.TrackPopupMenu(
+                    menu, 0x0100 | 0x0002, point.x, point.y, 0,
+                    self.hwnd, None)
+                if command == self.CMD_HOUR:
+                    self.widget.toggle_tray_option("tray_show_hour5")
+                elif command == self.CMD_WEEK:
+                    self.widget.toggle_tray_option("tray_show_week")
+                elif command == self.CMD_OPEN:
+                    self.widget.open_widget()
+                elif command == self.CMD_QUIT:
+                    self.widget.quit_app()
+                self.user32.PostMessageW(self.hwnd, 0, 0, 0)
+            finally:
+                self.user32.DestroyMenu(menu)
+
+        def close(self):
+            self.shell32.Shell_NotifyIconW(
+                2, self.ctypes.byref(self.nid))
+            if self.icon_handle:
+                self.user32.DestroyIcon(self.icon_handle)
+                self.icon_handle = None
+
+    class WindowsPanelStrip:
+        """A wide, taskbar-adjacent usage strip; Windows has no taskbar widget API."""
+
+        def __init__(self, window, widget):
+            import ctypes
+            from ctypes import wintypes
+
+            self.ctypes = ctypes
+            self.wintypes = wintypes
+            self.user32 = ctypes.windll.user32
+            self.user32.FindWindowW.argtypes = [
+                wintypes.LPCWSTR, wintypes.LPCWSTR]
+            self.user32.FindWindowW.restype = wintypes.HWND
+            self.user32.FindWindowExW.argtypes = [
+                wintypes.HWND, wintypes.HWND, wintypes.LPCWSTR,
+                wintypes.LPCWSTR]
+            self.user32.FindWindowExW.restype = wintypes.HWND
+            self.user32.GetWindowRect.argtypes = [
+                wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+            self.user32.GetWindowRect.restype = wintypes.BOOL
+            self.window = tk.Toplevel(window)
+            self.widget = widget
+            self.window.overrideredirect(True)
+            self.window.attributes("-topmost", True)
+            self.window.configure(bg=TK_BG)
+            self.tooltip = Tooltip(self.window)
+            self.icon_path = APP_DIR / "panel-clawd.png"
+            self.icon_write_error = False
+            self.icon = tk.Label(self.window, bg=TK_BG, bd=0)
+            self.icon.pack(side="left", padx=(px(7), px(4)), pady=px(3))
+            self.groups = {}
+            for key, width in (("hour5", 95), ("week", 105)):
+                group = tk.Frame(self.window, bg=TK_BG)
+                title = tk.Label(
+                    group, bg=TK_BG, fg=TK_FG, font=(FONT, 8, "bold"))
+                title.pack(side="left", padx=(0, px(4)))
+                meter = Meter(group, px(width), TK_BG)
+                meter.canvas.pack(side="left", padx=(0, px(4)))
+                value = tk.Label(
+                    group, text="--%", bg=TK_BG, fg=TK_FG,
+                    font=(FONT, 8, "bold"), width=4, anchor="e")
+                value.pack(side="left", padx=(0, px(7)))
+                self.groups[key] = (group, title, meter, value)
+            self.bind_actions(self.window)
+            self.update_data()
+            self.position()
+
+        def bind_actions(self, widget):
+            widget.bind("<Button-1>", lambda _e: self.widget.open_widget())
+            widget.bind("<Button-3>", self.show_menu)
+            for child in widget.winfo_children():
+                child.bind("<Enter>", self.tooltip._schedule, add="+")
+                child.bind("<Leave>", self.tooltip._hide, add="+")
+                self.bind_actions(child)
+
+        def position(self):
+            user32 = self.user32
+            taskbar = user32.FindWindowW("Shell_TrayWnd", None)
+            rect = self.wintypes.RECT()
+            if taskbar and user32.GetWindowRect(taskbar, self.ctypes.byref(rect)):
+                width, height = self.window.winfo_reqwidth(), self.window.winfo_reqheight()
+                tray = user32.FindWindowExW(taskbar, None, "TrayNotifyWnd", None)
+                tray_rect = self.wintypes.RECT()
+                if tray and user32.GetWindowRect(
+                        tray, self.ctypes.byref(tray_rect)):
+                    x = tray_rect.left - width - px(8)
+                else:
+                    x = rect.right - width - px(8)
+                if rect.bottom - rect.top > rect.right - rect.left:
+                    x = rect.right + px(4) if rect.left < self.window.winfo_screenwidth() // 2 else rect.left - width - px(4)
+                    y = rect.top
+                elif rect.top < self.window.winfo_screenheight() // 2:
+                    x, y = rect.right - width - px(8), rect.bottom + px(4)
+                else:
+                    y = rect.top - height - px(4)
+                x = max(0, min(x, self.window.winfo_screenwidth() - width))
+                y = max(0, min(y, self.window.winfo_screenheight() - height))
+                self.window.geometry(f"+{x}+{y}")
+            self.window.after(1500, self.position)
+
+        def update_data(self):
+            if self.widget.stats:
+                for key, window_key, config_key in (
+                        ("hour5", "window_5h", "tray_show_hour5"),
+                        ("week", "window_7d", "tray_show_week")):
+                    group, title, meter, value = self.groups[key]
+                    visible = self.widget.config.get(config_key) is not False
+                    if visible:
+                        group.pack(side="left", pady=px(4))
+                    else:
+                        group.pack_forget()
+                    window = self.widget.stats.get(window_key) or {}
+                    pct = usage_progress(self.widget.stats, key)
+                    color = ("#e0645c" if pct >= 80 else
+                             "#e8a34c" if pct >= 50 else "#6fbf73")
+                    if window.get("quota_pct") is None:
+                        color = TK_NEUTRAL
+                    title.configure(text=TR[self.widget.lang][f"{key}_short"])
+                    meter.set(pct, color)
+                    value.configure(text=f"{pct:.0f}%")
+                self.tooltip.set(tray_tooltip(
+                    self.widget.stats, self.widget.lang, self.widget.config),
+                    "right" if self.widget.rtl else "left")
+            self.window.after(1000, self.update_data)
+
+        def set_frame(self, frame):
+            try:
+                atomic_write(self.icon_path, clawd_png(icon_grid(frame), 2))
+            except OSError as exc:
+                if not self.icon_write_error:
+                    log_update_failure(f"Could not write Windows panel icon: {exc}")
+                    self.icon_write_error = True
+                return
+            self.icon_write_error = False
+            self.photo = tk.PhotoImage(file=str(self.icon_path))
+            self.icon.configure(image=self.photo)
+
+        def show_menu(self, _event=None):
+            menu = tk.Menu(self.window, tearoff=False)
+            for key in ("tray_show_hour5", "tray_show_week"):
+                label = TR[self.widget.lang][key]
+                menu.add_checkbutton(
+                    label=label,
+                    variable=tk.BooleanVar(
+                        master=self.window,
+                        value=self.widget.config.get(key) is not False),
+                    command=lambda item=key:
+                    self.widget.toggle_tray_option(item))
+            menu.add_separator()
+            menu.add_command(
+                label=TR[self.widget.lang]["tray_open"],
+                command=self.widget.open_widget)
+            menu.add_command(
+                label=TR[self.widget.lang]["tray_quit"],
+                command=self.widget.quit_app)
+            menu.tk_popup(self.window.winfo_pointerx(),
+                          self.window.winfo_pointery())
+
+        def close(self):
+            self.window.destroy()
+
     class Widget:
         def __init__(self, root):
             self.root = root
@@ -1747,6 +2602,11 @@ def run_gui_tk():
             self.frames_mini = FrameCache(MINI_CELL, TK_CARD)
             self.clawd = ClawdEngine()
             self.clawd_mini_engine = MiniClawdEngine()
+            self.panel_clawd = MiniClawdEngine()
+            self.update_state = ""
+            self.update_error = None
+            self.update_checking = False
+            self.update_result = None
             self.polling = False
             self.poll_result = None
             self.session_active = False
@@ -1758,13 +2618,12 @@ def run_gui_tk():
             root.configure(bg=TK_BG)
             root.overrideredirect(True)
             root.attributes("-topmost", True)
-            root.bind("<Escape>", lambda _e: self.quit())
-            root.protocol("WM_DELETE_WINDOW", self.quit)
+            root.bind("<Escape>", lambda _e: self.hide())
+            root.protocol("WM_DELETE_WINDOW", self.hide)
 
             self.pages = {}
             self.build()
             self.set_mode(self.mode, first=True)
-            self.refresh()
             # A window has no true size until it is mapped, and a withdrawn
             # one reports 1x1 - which put the widget's left edge where its
             # right edge belonged. Map it out of sight, measure, then move it
@@ -1773,13 +2632,20 @@ def run_gui_tk():
             root.deiconify()
             root.update()
             self.restore_position()
+            self.panel_strip = WindowsPanelStrip(root, self)
+            self.refresh()
 
             root.after(REFRESH_SECONDS * 1000, self.tick_refresh)
             root.after(120, self.animate_big)
             root.after(350, self.animate_mini)
+            root.after(350, self.animate_tray)
             root.after(WATCH_SECONDS * 1000, self.watch)
             root.after(1000, self.tick_countdown)
             root.after(USAGE_POLL_SECONDS * 1000, self.tick_usage_poll)
+            if is_managed_install():
+                self.check_for_updates()
+                root.after(UPDATE_CHECK_SECONDS * 1000,
+                           self.tick_update_check)
             self.spawn_usage_poll()
 
         # ---------------------------------------------------------- chrome
@@ -1839,7 +2705,24 @@ def run_gui_tk():
             self.root.geometry("+%d+%d" % (x, y))
 
         def quit(self):
+            self.hide()
+
+        def hide(self):
+            self.root.withdraw()
+
+        def quit_app(self):
+            self.panel_strip.close()
             self.root.destroy()
+
+        def open_widget(self):
+            self.root.deiconify()
+            self.root.lift()
+            self.root.focus_force()
+
+        def toggle_tray_option(self, key):
+            enabled = self.config.get(key) is not False
+            self.config = update_config(**{key: not enabled})
+            self.panel_strip.update_data()
 
         # ----------------------------------------------------------- pages
         def build(self):
@@ -1945,6 +2828,12 @@ def run_gui_tk():
                                    justify="right" if self.rtl else "left",
                                    wraplength=CONTENT_W)
             self.footer.pack(fill="x", pady=(px(8), 0))
+            self.update_label = tk.Label(
+                card, text=update_status_text(
+                    self.lang, self.update_state, self.update_error),
+                bg=TK_CARD, fg=TK_MUTED, font=(FONT, 8),
+                anchor=self.anchor, justify="right" if self.rtl else "left")
+            self.update_label.pack(fill="x")
 
         def build_mini(self):
             card = tk.Frame(self.root, bg=TK_CARD, padx=MINI_PAD, pady=MINI_PAD)
@@ -2012,6 +2901,36 @@ def run_gui_tk():
         def manual_refresh(self):
             self.refresh()
 
+        def render_update_status(self):
+            self.update_label.configure(text=update_status_text(
+                self.lang, self.update_state, self.update_error))
+
+        def check_for_updates(self):
+            if self.update_checking:
+                return
+            self.update_checking = True
+            self.update_state, self.update_error = "checking", None
+            self.render_update_status()
+
+            def work():
+                try:
+                    changed = install_latest_update()
+                    panel_changed = (
+                        install_latest_gnome_extension() if changed else False)
+                    result = (
+                        "restarting" if changed or panel_changed else "current",
+                        None)
+                except Exception as exc:
+                    result = ("error", log_update_failure(exc))
+                self.update_result = result
+
+            threading.Thread(target=work, daemon=True).start()
+
+        def tick_update_check(self):
+            self.check_for_updates()
+            self.root.after(UPDATE_CHECK_SECONDS * 1000,
+                            self.tick_update_check)
+
         # ------------------------------------------------------------ data
         def tick_refresh(self):
             self.refresh()
@@ -2051,6 +2970,7 @@ def run_gui_tk():
                 self.tiles[key].configure(text=text)
             self.footer.configure(text=hp_line(s["total_tokens"], self.lang))
             self.tick_meters()
+            self.panel_strip.update_data()
             for title, body, critical in alert_messages(s, self.alerted,
                                                         self.lang):
                 notify(title, body, critical)
@@ -2078,6 +2998,11 @@ def run_gui_tk():
             self.root.after(USAGE_POLL_SECONDS * 1000, self.tick_usage_poll)
 
         def tick_countdown(self):
+            if self.update_result is not None:
+                self.update_state, self.update_error = self.update_result
+                self.update_result = None
+                self.update_checking = False
+                self.render_update_status()
             if self.poll_result is not None:
                 self.poll_result = None
                 self.refresh()
@@ -2132,6 +3057,7 @@ def run_gui_tk():
                     val.configure(text=text)
                     bar.set(elapsed, color)
                     bar.tip.set(tip, "right" if self.rtl else "left")
+            self.panel_strip.update_data()
 
         def update_heatmap(self):
             activity = {date.fromisoformat(k): v
@@ -2167,6 +3093,12 @@ def run_gui_tk():
                                           image=self.frames_mini.get(**kw))
                 self.corner.coords(self.clawd_mini, 0, y)
             self.root.after(350, self.animate_mini)
+
+        def animate_tray(self):
+            kw, _y = self.panel_clawd.step(
+                self.session_active, self.stats.get("week_quota_pct") or 0)
+            self.panel_strip.set_frame(clawd_grid(**kw))
+            self.root.after(350, self.animate_tray)
 
     try:
         root.iconphoto(True, tk.PhotoImage(file=str(ICON_PATH)))

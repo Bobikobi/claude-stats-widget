@@ -5,8 +5,9 @@ session and weekly quota is gone, how much you have written, and a
 contribution-style heatmap of your activity - with Clawd, the Claude Code
 mascot, wandering around at the bottom.
 
-Runs on **Linux** (GTK3) and **Windows** (Tkinter). One self-contained file, no
-dependencies beyond what the desktop already has.
+Runs on **Linux** (GTK3 plus a GNOME Shell extension) and **Windows**
+(Tkinter). A wide, animated Clawd-and-usage strip sits just left of the clock
+in the GNOME panel or next to the Windows taskbar's notification area.
 
 ```text
 ✳ Claude Code - Usage                        ⟳  🗕  עב  ✕
@@ -48,7 +49,13 @@ streaks, peak hour, favourite model and the heatmap are computed from the
 transcripts in `~/.claude/projects/**/*.jsonl`, using the same counting rules as
 Claude's own stats page (every entry counted, no de-duplication).
 
-Nothing is uploaded anywhere. The widget makes no network calls of its own.
+Your transcripts and usage data are never uploaded by the widget. Installed
+copies check GitHub for updates at startup and every six hours, downloading
+the public widget source and, on Linux, its GNOME panel assets. Failed checks
+are shown in the widget and logged to
+`~/.cache/claude-stats-widget/update.log` on Linux or
+`%LOCALAPPDATA%\claude-stats-widget\update.log` on Windows. Source checkouts do
+not self-update.
 
 ## Install
 
@@ -105,9 +112,11 @@ curl -fsSL https://raw.githubusercontent.com/Bobikobi/claude-stats-widget/main/i
 ```
 
 That fetches the widget, installs it to `~/.local/bin`, draws the Clawd icon,
-adds a desktop entry plus a desktop shortcut, and starts it. Piped like this
-there is nobody to answer the autostart question, so it is not enabled; run the
-script from a terminal if you want it.
+installs and enables the GNOME panel extension, adds a desktop entry plus a
+desktop shortcut, and starts it. If GNOME cannot load the new extension until
+the next login, sign out and back in. Piped like this there is nobody to answer
+the autostart question, so it is not enabled; run the script from a terminal
+if you want it.
 
 ```sh
 git clone https://github.com/Bobikobi/claude-stats-widget.git
@@ -118,11 +127,13 @@ cd claude-stats-widget
 `./install.sh --uninstall` removes everything and leaves your settings alone;
 `--no-desktop-shortcut` skips the desktop copy.
 
-Manual install is just as easy - the widget is a single self-contained file:
+Manual install copies the GTK widget itself:
 
 ```sh
 cp claude-stats-widget ~/.local/bin/ && chmod +x ~/.local/bin/claude-stats-widget
 ```
+
+Use `install.sh` as above to also install the GNOME panel strip.
 
 </details>
 
@@ -133,9 +144,24 @@ cp claude-stats-widget ~/.local/bin/ && chmod +x ~/.local/bin/claude-stats-widge
 | Switch to Hebrew and back | `עב` / `EN` button (see below) |
 | Shrink to a corner cube | `🗕` button, `⤢` to expand again |
 | Refresh now | `⟳` button |
+| Show the widget from the panel strip | Click Clawd; right-click to choose hourly/weekly meters |
 | Move the window | Drag it (on Wayland: `Super` + drag) |
-| Close | `✕` or `Esc` |
+| Hide the main widget | `✕` or `Esc`; the panel strip stays available |
 | Print stats as JSON | `claude-stats-widget --json` |
+
+The panel strip shows animated Clawd and long horizontal 5-hour and weekly
+meters, with readable percentages. Hover for quota/reset details; right-click
+to choose which meters are visible. When `/usage` is unavailable, the bar
+shows elapsed window time rather than pretending it is quota use.
+On Windows the strip is a separate, topmost window positioned beside the
+notification area; Windows does not provide a public API for third-party
+widgets embedded inside the taskbar.
+
+Installed copies check for updates automatically at startup and every six
+hours. A valid update is installed atomically and the widget restarts itself;
+the status line shows update checks and any errors. The updater only accepts a
+strictly higher `APP_VERSION`, so development builds are not replaced by older
+published code.
 
 Preferences are remembered between runs, in
 `~/.config/claude-stats-widget.json` on Linux and
@@ -177,14 +203,15 @@ one shared engine, so the two builds cannot drift into being two characters.
 
 ## How the two builds fit together
 
-One file, one set of numbers, two front ends. Everything that decides what the
-widget *says* - reading the transcripts, polling `/usage`, the streak and
-heatmap maths, Clawd's choice of activity - is shared. Only the drawing is
-per-platform, and the file picks its toolkit at startup:
+One Python app, one set of numbers, two desktop platforms. Everything that
+decides what the widget *says* - reading the transcripts, polling `/usage`,
+the streak and heatmap maths, Clawd's choice of activity - is shared. The Linux
+panel strip is a small GNOME Shell companion that reads the app's local state;
+Windows draws its strip with Tkinter:
 
 | | Linux | Windows |
 |---|---|---|
-| Toolkit | GTK3 (`python3-gi`) | Tkinter (ships with Python) |
+| Toolkit | GTK3 + GNOME Shell extension | Tkinter (ships with Python) |
 | Notifications | `notify-send` | Windows toast |
 | Settings | `~/.config` | `%APPDATA%` |
 | Cache and icon | `~/.cache`, `~/.local/share/icons` | `%LOCALAPPDATA%` |
@@ -198,8 +225,12 @@ installed at all.
 ## Requirements
 
 **Linux** - GTK 3 (`python3-gi`, present by default on Ubuntu and Fedora) and
-Python 3.9+. Tested on Ubuntu with GNOME under Wayland. `set_keep_above` is
-honoured on X11 only; on Wayland use your compositor's "always on top" instead.
+Python 3.9+. The wide panel strip requires GNOME Shell 45 or newer and is
+installed/enabled by `install.sh`; sign out and back in if GNOME cannot load a
+newly installed extension immediately. Other desktop environments can still
+run the main GTK widget, but do not have this GNOME-specific panel strip.
+`set_keep_above` is honoured on X11 only; on Wayland use your compositor's
+"always on top" instead.
 
 **Windows** - Windows 10 or 11 and Python 3.9+ with Tkinter, which is what the
 python.org installer gives you by default (keep "tcl/tk and IDLE" ticked).
@@ -219,6 +250,8 @@ extension, or not at all while it sits there showing you yesterday's numbers.
 
 - The quota reading refreshes every five minutes, so during a heavy burst it
   can lag by a few percent. `/usage` in a session is always the live truth.
+- The Linux meter is a GNOME panel extension. The Windows meter is a separate
+  taskbar-adjacent overlay, not a native Windows taskbar widget.
 - `/usage` itself reports that its breakdown is approximate and covers only
   local sessions on this machine, not other devices or claude.ai.
 - The widget reads its own logs only; it never reads message content for

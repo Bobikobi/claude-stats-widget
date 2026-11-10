@@ -2,33 +2,61 @@
 # Install (or remove) the Claude Stats Widget for the current user.
 set -euo pipefail
 
+NAME="claude-stats-widget"
+REF="${CSW_REF:-main}"
+RAW_URL="https://raw.githubusercontent.com/Bobikobi/$NAME/$REF/$NAME"
+EXTENSION_ID="claude-stats-widget@bobikobi"
 BIN_DIR="${XDG_BIN_HOME:-$HOME/.local/bin}"
 APP_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
 ICON_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/icons"
 AUTOSTART_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/autostart"
-NAME="claude-stats-widget"
-REF="${CSW_REF:-main}"
-RAW_URL="https://raw.githubusercontent.com/Bobikobi/$NAME/$REF/$NAME"
+GNOME_EXTENSION_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/gnome-shell/extensions/$EXTENSION_ID"
+SOURCE_DIR=""
+EXT_SOURCE_DIR=""
+TEMP_SRC=""
+TEMP_EXT_DIR=""
+
+fetch_url() {
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$1" -o "$2"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO "$2" "$1"
+    else
+        echo "Need curl or wget to download the widget and GNOME panel extension." >&2
+        exit 1
+    fi
+}
+
+cleanup() {
+    [ -z "$TEMP_SRC" ] || rm -f -- "$TEMP_SRC"
+    [ -z "$TEMP_EXT_DIR" ] || rm -rf -- "$TEMP_EXT_DIR"
+}
+trap cleanup EXIT
 
 # Next to this script when the repo was cloned; downloaded when the script is
 # being piped straight into bash, where there is no script directory and no
 # sibling file. Nothing else is needed: no git, no editor, no build step.
 SRC=""
 if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
-    SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$NAME"
+    SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    SRC="$SOURCE_DIR/$NAME"
 fi
 if [ -z "$SRC" ] || [ ! -f "$SRC" ]; then
     SRC="$(mktemp -t "$NAME.XXXXXX")"
-    trap 'rm -f "$SRC"' EXIT
+    TEMP_SRC="$SRC"
     echo "Fetching the widget from $REF ..."
-    if command -v curl >/dev/null 2>&1; then
-        curl -fsSL "$RAW_URL" -o "$SRC"
-    elif command -v wget >/dev/null 2>&1; then
-        wget -qO "$SRC" "$RAW_URL"
-    else
-        echo "Need curl or wget to download the widget." >&2
-        exit 1
-    fi
+    fetch_url "$RAW_URL" "$SRC"
+fi
+
+if [ -n "$SOURCE_DIR" ] && [ -d "$SOURCE_DIR/gnome-extension" ]; then
+    EXT_SOURCE_DIR="$SOURCE_DIR/gnome-extension"
+else
+    EXT_SOURCE_DIR="$(mktemp -d -t "$NAME-extension.XXXXXX")"
+    TEMP_EXT_DIR="$EXT_SOURCE_DIR"
+    for extension_file in extension.js metadata.json; do
+        extension_url="https://raw.githubusercontent.com/Bobikobi/$NAME/$REF/gnome-extension/$extension_file"
+        fetch_url "$extension_url" "$EXT_SOURCE_DIR/$extension_file"
+    done
 fi
 
 # Where the desktop actually is. It is localised - a Hebrew or French desktop
@@ -55,9 +83,13 @@ desktop_dir() {
 DESKTOP_DIR="$(desktop_dir)"
 
 uninstall() {
+    if command -v gnome-extensions >/dev/null 2>&1; then
+        gnome-extensions disable "$EXTENSION_ID" 2>/dev/null || true
+    fi
     rm -f "$BIN_DIR/$NAME" "$APP_DIR/$NAME.desktop" \
           "$AUTOSTART_DIR/$NAME.desktop" "$ICON_DIR/claude-clawd.png" \
           "$DESKTOP_DIR/$NAME.desktop" "$HOME/Desktop/$NAME.desktop"
+    rm -rf -- "$GNOME_EXTENSION_DIR"
     echo "Removed. Your settings in ~/.config/$NAME.json were left alone."
     exit 0
 }
@@ -68,14 +100,65 @@ NO_DESKTOP_SHORTCUT=0
 [ "${1:-}" = "--no-desktop-shortcut" ] && NO_DESKTOP_SHORTCUT=1
 
 command -v python3 >/dev/null || { echo "python3 is required." >&2; exit 1; }
-python3 -c 'import gi; gi.require_version("Gtk","3.0"); from gi.repository import Gtk' 2>/dev/null || {
-    echo "GTK 3 bindings are missing. Install python3-gi (Debian/Ubuntu:" >&2
-    echo "  sudo apt install python3-gi gir1.2-gtk-3.0)" >&2
+python3 - <<'PY' 2>/dev/null || {
+import os
+for key in tuple(os.environ):
+    if key.startswith("SNAP") or key in (
+            "GTK_PATH", "GTK_EXE_PREFIX", "GTK_IM_MODULE_FILE",
+            "GSETTINGS_SCHEMA_DIR"):
+        os.environ.pop(key, None)
+import gi
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gtk
+PY
+    echo "GTK 3 bindings are required. On Ubuntu/Debian install:" >&2
+    echo "  sudo apt install python3-gi gir1.2-gtk-3.0" >&2
     exit 1
 }
 
 mkdir -p "$BIN_DIR" "$APP_DIR" "$ICON_DIR"
 install -m 755 "$SRC" "$BIN_DIR/$NAME"
+mkdir -p "$GNOME_EXTENSION_DIR"
+for extension_file in extension.js metadata.json; do
+    install -m 644 "$EXT_SOURCE_DIR/$extension_file" \
+        "$GNOME_EXTENSION_DIR/$extension_file"
+done
+rm -f -- "$GNOME_EXTENSION_DIR/stylesheet.css"
+if command -v gnome-extensions >/dev/null 2>&1; then
+    if gnome-extensions enable "$EXTENSION_ID"; then
+        echo "GNOME panel strip enabled."
+    else
+        echo "GNOME has not discovered the new extension in this session."
+    fi
+fi
+if python3 - "$EXTENSION_ID" <<'PY'
+import os
+import sys
+for key in tuple(os.environ):
+    if key.startswith("SNAP") or key in (
+            "GTK_PATH", "GTK_EXE_PREFIX", "GTK_IM_MODULE_FILE",
+            "GSETTINGS_SCHEMA_DIR"):
+        os.environ.pop(key, None)
+import gi
+from gi.repository import Gio
+
+settings = Gio.Settings.new("org.gnome.shell")
+extension_id = sys.argv[1]
+enabled = settings.get_strv("enabled-extensions")
+if extension_id not in enabled:
+    settings.set_strv("enabled-extensions", enabled + [extension_id])
+disabled = settings.get_strv("disabled-extensions")
+if extension_id in disabled:
+    settings.set_strv(
+        "disabled-extensions",
+        [item for item in disabled if item != extension_id])
+PY
+then
+    echo "GNOME panel strip is enabled; sign out and back in to load the new extension."
+else
+    echo "Extension files installed, but GNOME could not enable them automatically."
+    echo "After signing out and back in, run: gnome-extensions enable $EXTENSION_ID"
+fi
 
 # draw the Clawd icon once, so the launcher and notifications have it
 "$BIN_DIR/$NAME" --write-icon >/dev/null 2>&1 || true
@@ -115,11 +198,14 @@ fi
 reply=""
 asked=0
 if [ -t 0 ]; then
-    read -r -p "Start the widget automatically at login? [Y/n] " reply || true
-    asked=1
+    if read -r -p "Start the widget automatically at login? [Y/n] " reply; then
+        asked=1
+    fi
 elif [ -r /dev/tty ]; then
-    read -r -p "Start the widget automatically at login? [Y/n] " reply < /dev/tty || true
-    asked=1
+    if { read -r -p "Start the widget automatically at login? [Y/n] " \
+            reply < /dev/tty; } 2>/dev/null; then
+        asked=1
+    fi
 fi
 
 if [ "$asked" -eq 1 ] && [[ ! "${reply:-y}" =~ ^[Nn] ]]; then

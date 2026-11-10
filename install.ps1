@@ -171,7 +171,7 @@ if (-not $NoLaunch) {
         Where-Object { $_.CommandLine -like "*$Name*" } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     Start-Process -FilePath $pythonw -ArgumentList "`"$Target`"" -WorkingDirectory $InstallTo
-    Write-Host 'Started. Look for it near the top right of your screen.'
+    Write-Host 'Started. Look for the usage strip beside the taskbar notification area.'
 } else {
     Write-Host "Launch it from the Start Menu, the desktop, or run: `"$pythonw`" `"$Target`""
 }
