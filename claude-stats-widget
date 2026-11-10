@@ -119,6 +119,9 @@ TR = {
         "update_current": "",
         "update_restarting": "העדכון הותקן; מרענן…",
         "update_error": "עדכון אוטומטי נכשל: {error}",
+        "update_disabled": "עדכון אוטומטי כבוי",
+        "auto_update": "עדכון אוטומטי",
+        "auto_update_tip": "מוריד ומריץ קוד מהענף הראשי ב-GitHub, ללא חתימה",
     },
     "en": {
         "title": "✳ Claude Code - Usage",
@@ -159,6 +162,9 @@ TR = {
         "update_current": "",
         "update_restarting": "Update installed; reloading…",
         "update_error": "Automatic update failed: {error}",
+        "update_disabled": "Auto-update off",
+        "auto_update": "Auto-update",
+        "auto_update_tip": "Downloads and runs code from GitHub main, unsigned",
     },
 }
 
@@ -716,6 +722,27 @@ def log_update_failure(error):
     except OSError as log_error:
         return f"{error} (also could not write {log_path}: {log_error})"
     return str(error)
+
+
+def auto_update_enabled():
+    """Opt-in: only an explicit true in the config turns the updater on."""
+    return load_config().get("auto_update") is True
+
+
+def perform_update_check():
+    """The one entry point that touches the network for updates.
+
+    Returns (state, error). With auto_update off, nothing is requested.
+    """
+    if not auto_update_enabled():
+        return "disabled", None
+    try:
+        changed = install_latest_update()
+        panel_changed = (
+            install_latest_gnome_extension() if changed else False)
+        return ("restarting" if changed or panel_changed else "current"), None
+    except Exception as exc:
+        return "error", log_update_failure(exc)
 
 
 def update_status_text(lang, state, error=None):
@@ -1541,10 +1568,8 @@ def run_gui_gtk():
             GLib.timeout_add_seconds(1, self.tick_countdown)
             GLib.timeout_add_seconds(USAGE_POLL_SECONDS, self.spawn_usage_poll)
             GLib.timeout_add(250, self.check_panel_command)
-            if is_managed_install():
-                self.check_for_updates()
-                GLib.timeout_add_seconds(
-                    UPDATE_CHECK_SECONDS, self.check_for_updates)
+            self.update_timer = False
+            self.sync_update_schedule()
             self.spawn_usage_poll()
 
         # ---------------------------------------------------------- pages
@@ -1669,6 +1694,12 @@ def run_gui_gtk():
             self.update_label.set_halign(Gtk.Align.START)
             outer.pack_start(self.update_label, False, False, 0)
 
+            self.auto_update_check = Gtk.CheckButton(label=TR[self.lang]["auto_update"])
+            self.auto_update_check.set_tooltip_text(TR[self.lang]["auto_update_tip"])
+            self.auto_update_check.set_active(auto_update_enabled())
+            self.auto_update_check.connect("toggled", self.on_toggle_auto_update)
+            outer.pack_start(self.auto_update_check, False, False, 0)
+
             self.stack.add_named(outer, "expanded")
 
         def build_mini(self):
@@ -1748,6 +1779,8 @@ def run_gui_gtk():
                 pass
             if self.stats:
                 self.footer.set_text(hp_line(self.stats["total_tokens"], self.lang))
+            self.auto_update_check.set_label(t["auto_update"])
+            self.auto_update_check.set_tooltip_text(t["auto_update_tip"])
             self.render_update_status()
             self.publish_panel_state()
 
@@ -1856,7 +1889,26 @@ def run_gui_gtk():
                 update_status_text(
                     self.lang, self.update_state, self.update_error))
 
+        def sync_update_schedule(self):
+            """Start the startup check and 6-hourly timer only when opted in."""
+            if (auto_update_enabled() and is_managed_install()
+                    and not self.update_timer):
+                self.update_timer = True
+                self.check_for_updates()
+                GLib.timeout_add_seconds(
+                    UPDATE_CHECK_SECONDS, self.check_for_updates)
+            elif not auto_update_enabled():
+                self.update_state, self.update_error = "disabled", None
+                self.render_update_status()
+
+        def on_toggle_auto_update(self, btn):
+            self.config = update_config(auto_update=btn.get_active())
+            self.sync_update_schedule()
+
         def check_for_updates(self):
+            if not auto_update_enabled():
+                self.update_timer = False
+                return False  # drops the timer
             if self.update_checking:
                 return True
             self.update_checking = True
@@ -1864,16 +1916,7 @@ def run_gui_gtk():
             self.render_update_status()
 
             def work():
-                try:
-                    changed = install_latest_update()
-                    panel_changed = (
-                        install_latest_gnome_extension() if changed else False)
-                    state, error = (
-                        ("restarting", None)
-                        if changed or panel_changed else ("current", None))
-                except Exception as exc:
-                    state = "error"
-                    error = log_update_failure(exc)
+                state, error = perform_update_check()
                 GLib.idle_add(self.finish_update_check, state, error)
 
             threading.Thread(target=work, daemon=True).start()
@@ -2578,6 +2621,11 @@ def run_gui_tk():
                         value=self.widget.config.get(key) is not False),
                     command=lambda item=key:
                     self.widget.toggle_tray_option(item))
+            menu.add_checkbutton(
+                label=TR[self.widget.lang]["auto_update"],
+                variable=tk.BooleanVar(
+                    master=self.window, value=auto_update_enabled()),
+                command=self.widget.toggle_auto_update)
             menu.add_separator()
             menu.add_command(
                 label=TR[self.widget.lang]["tray_open"],
@@ -2642,10 +2690,8 @@ def run_gui_tk():
             root.after(WATCH_SECONDS * 1000, self.watch)
             root.after(1000, self.tick_countdown)
             root.after(USAGE_POLL_SECONDS * 1000, self.tick_usage_poll)
-            if is_managed_install():
-                self.check_for_updates()
-                root.after(UPDATE_CHECK_SECONDS * 1000,
-                           self.tick_update_check)
+            self.update_timer = False
+            self.sync_update_schedule()
             self.spawn_usage_poll()
 
         # ---------------------------------------------------------- chrome
@@ -2834,6 +2880,8 @@ def run_gui_tk():
                 bg=TK_CARD, fg=TK_MUTED, font=(FONT, 8),
                 anchor=self.anchor, justify="right" if self.rtl else "left")
             self.update_label.pack(fill="x")
+            self.update_label.bind(
+                "<Button-1>", lambda _e: self.toggle_auto_update())
 
         def build_mini(self):
             card = tk.Frame(self.root, bg=TK_CARD, padx=MINI_PAD, pady=MINI_PAD)
@@ -2905,7 +2953,23 @@ def run_gui_tk():
             self.update_label.configure(text=update_status_text(
                 self.lang, self.update_state, self.update_error))
 
+        def sync_update_schedule(self):
+            """Start the startup check and 6-hourly timer only when opted in."""
+            if (auto_update_enabled() and is_managed_install()
+                    and not self.update_timer):
+                self.update_timer = True
+                self.tick_update_check()
+            elif not auto_update_enabled():
+                self.update_state, self.update_error = "disabled", None
+                self.render_update_status()
+
+        def toggle_auto_update(self):
+            self.config = update_config(auto_update=not auto_update_enabled())
+            self.sync_update_schedule()
+
         def check_for_updates(self):
+            if not auto_update_enabled():
+                return
             if self.update_checking:
                 return
             self.update_checking = True
@@ -2913,20 +2977,14 @@ def run_gui_tk():
             self.render_update_status()
 
             def work():
-                try:
-                    changed = install_latest_update()
-                    panel_changed = (
-                        install_latest_gnome_extension() if changed else False)
-                    result = (
-                        "restarting" if changed or panel_changed else "current",
-                        None)
-                except Exception as exc:
-                    result = ("error", log_update_failure(exc))
-                self.update_result = result
+                self.update_result = perform_update_check()
 
             threading.Thread(target=work, daemon=True).start()
 
         def tick_update_check(self):
+            if not auto_update_enabled():
+                self.update_timer = False
+                return  # timer stops
             self.check_for_updates()
             self.root.after(UPDATE_CHECK_SECONDS * 1000,
                             self.tick_update_check)
