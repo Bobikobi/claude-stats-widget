@@ -39,6 +39,9 @@ jobs:
           python - <<'PY'
           import importlib.util, json
           from importlib.machinery import SourceFileLoader
+          from pathlib import Path
+          from tempfile import TemporaryDirectory
+          from unittest.mock import patch
           loader = SourceFileLoader("csw", "claude-stats-widget")
           spec = importlib.util.spec_from_loader("csw", loader)
           m = importlib.util.module_from_spec(spec)
@@ -66,6 +69,101 @@ jobs:
               "Current week (all models): 7% used (resets Sunday)")
           assert report["session_pct"] == 42, report
           assert report["week_pct"] == 7, report
+
+          tray_stats = {
+              "window_5h": {"quota_pct": 42, "window_seconds": 18_000},
+              "window_7d": {"quota_pct": 7, "window_seconds": 604_800},
+          }
+          assert m.tray_tooltip(tray_stats, "en", {}, now_ts=0) == (
+              "Claude Stats\n5h: 42%\n7d: 7%")
+          assert m.tray_tooltip(
+              tray_stats, "en", {"tray_show_hour5": False}, now_ts=0) == (
+                  "Claude Stats\n7d: 7%")
+          assert m.usage_progress(tray_stats, "hour5", now_ts=0) == 42
+          panel = m.panel_state(
+              tray_stats, "en", {}, "clawd-1.png", now_ts=0)
+          assert panel["hour5_pct"] == 42
+          assert panel["week_pct"] == 7
+          assert panel["show_hour5"] and panel["show_week"]
+          assert panel["icon"] == "clawd-1.png"
+          tray_stats["window_5h"] = {
+              "quota_pct": None, "resets_at": 9_000, "window_seconds": 18_000}
+          tray_stats["window_7d"] = {
+              "quota_pct": None, "resets_at": 86_400, "window_seconds": 604_800}
+          tooltip = m.tray_tooltip(tray_stats, "en", {}, now_ts=0)
+          assert "50% (time progress, not quota use)" in tooltip, tooltip
+          assert "resets in 1d 0h" in tooltip, tooltip
+          assert m.usage_progress(tray_stats, "hour5", now_ts=0) == 50
+          tray_png = m.clawd_png(
+              m.tray_icon_grid(m.clawd_grid(), 42), 1)
+          assert tray_png.startswith(b"\x89PNG\r\n\x1a\n"), tray_png[:8]
+          for pct, color in ((0, "2"), (50, "3"), (100, "5")):
+              grid = m.tray_icon_grid(m.clawd_grid(), pct)
+              assert len(grid) == 16 and all(len(row) == 16 for row in grid)
+              assert all(row[-2] == "L" for row in grid)
+              assert sum(row[-1] == color for row in grid) == round(
+                  16 * pct / 100)
+
+          class Response:
+              def __init__(self, content):
+                  self.content = content
+              def __enter__(self):
+                  return self
+              def __exit__(self, *args):
+                  return None
+              def read(self, _limit):
+                  return self.content
+
+          extension_files = {
+              "extension.js": b"export default class Test {};\n",
+              "metadata.json": json.dumps({
+                  "uuid": "claude-stats-widget@bobikobi",
+              }).encode(),
+          }
+          with TemporaryDirectory() as directory:
+              extension_dir = (
+                  Path(directory) / "gnome-shell" / "extensions"
+                  / "claude-stats-widget@bobikobi")
+              extension_dir.mkdir(parents=True)
+              replies = [Response(extension_files[name])
+                         for name in ("extension.js", "metadata.json")]
+              with patch.object(m, "IS_WINDOWS", False), \
+                      patch.dict("os.environ", {
+                          "XDG_DATA_HOME": directory, "PATH": "/usr/bin",
+                      }, clear=True), \
+                      patch.object(m, "urlopen", side_effect=replies):
+                  assert m.install_latest_gnome_extension()
+              for name, content in extension_files.items():
+                  assert (extension_dir / name).read_bytes() == content
+
+          with TemporaryDirectory() as directory:
+              target = Path(directory) / "widget"
+              target.write_text("old = True\n", encoding="utf-8")
+              target.chmod(0o755)
+              new_source = b"APP_VERSION = (1, 0, 0)\nnew = True\n"
+              with patch.object(m, "urlopen", return_value=Response(new_source)):
+                  assert m.install_latest_update(target, "https://example.test/widget")
+              assert target.read_bytes() == new_source
+              assert target.stat().st_mode & 0o777 == 0o755
+              with patch.object(m, "urlopen", return_value=Response(new_source)):
+                  assert not m.install_latest_update(target, "https://example.test/widget")
+              next_source = b"APP_VERSION = (1, 0, 1)\nnew = True\n"
+              with patch.object(m, "urlopen", return_value=Response(next_source)):
+                  assert m.install_latest_update(
+                      target, "https://example.test/widget")
+              older_source = b"APP_VERSION = (0, 9, 9)\nolder = True\n"
+              with patch.object(m, "urlopen", return_value=Response(older_source)):
+                  assert not m.install_latest_update(
+                      target, "https://example.test/widget")
+              bad_source = b"APP_VERSION = (1, 0, 2)\nnot python =\n"
+              with patch.object(m, "urlopen", return_value=Response(bad_source)):
+                  try:
+                      m.install_latest_update(target, "https://example.test/widget")
+                  except SyntaxError:
+                      pass
+                  else:
+                      raise AssertionError("invalid update was accepted")
+              assert target.read_bytes() == next_source
           print("ok")
           PY
 
@@ -94,3 +192,7 @@ jobs:
           # a Windows checkout is enough to introduce it
           ! grep -qU $'\r' install.sh || { echo "install.sh has CRLF"; exit 1; }
           ! grep -qU $'\r' claude-stats-widget || { echo "widget has CRLF"; exit 1; }
+
+      - name: GNOME extension parses
+        if: runner.os == 'Linux'
+        run: node --input-type=module --check < gnome-extension/extension.js
