@@ -1,5 +1,9 @@
 # Claude Stats Widget
 
+**A desktop widget for Linux (GNOME) and Windows that shows your real Claude Code session and weekly quota, an activity heatmap, and Clawd in pixel art.**
+
+Built by [Elad Saadon](https://www.eladsaadon.dev) - [see more projects](https://www.eladsaadon.dev/projects). Installed with one command (see [Install](#install)); MIT licensed.
+
 A small desktop widget that shows your Claude Code usage: how much of your
 session and weekly quota is gone, how much you have written, and a
 contribution-style heatmap of your activity - with Clawd, the Claude Code
