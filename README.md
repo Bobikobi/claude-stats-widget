@@ -50,8 +50,8 @@ transcripts in `~/.claude/projects/**/*.jsonl`, using the same counting rules as
 Claude's own stats page (every entry counted, no de-duplication).
 
 Your transcripts and usage data are never uploaded by the widget. Installed
-copies check GitHub for updates at startup and every six hours, downloading
-the public widget source and, on Linux, its GNOME panel assets. Failed checks
+copies can check GitHub for updates, but only if you turn auto-update on
+(see "Auto-update" below); it is off by default. Failed checks
 are shown in the widget and logged to
 `~/.cache/claude-stats-widget/update.log` on Linux or
 `%LOCALAPPDATA%\claude-stats-widget\update.log` on Windows. Source checkouts do
@@ -157,8 +157,19 @@ On Windows the strip is a separate, topmost window positioned beside the
 notification area; Windows does not provide a public API for third-party
 widgets embedded inside the taskbar.
 
-Installed copies check for updates automatically at startup and every six
-hours. A valid update is installed atomically and the widget restarts itself;
+### Auto-update (opt-in, off by default)
+
+Auto-update is off by default and the widget makes no update request at all
+until you enable it. Enable it with the "Auto-update" checkbox in the Linux
+window (or the notification-area menu on Windows), or by setting
+`"auto_update": true` in the config file below. When on, installed copies check
+for updates at startup and every six hours.
+
+The tradeoff: it downloads and runs code from the `main` branch over HTTPS, and
+that code is unsigned, so you trust the repository and your connection to it.
+If you prefer, leave it off and update by re-running the installer.
+
+When enabled, a valid update is installed atomically and the widget restarts itself;
 the status line shows update checks and any errors. The updater only accepts a
 strictly higher `APP_VERSION`, so development builds are not replaced by older
 published code.
