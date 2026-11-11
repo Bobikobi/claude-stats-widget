@@ -12,8 +12,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # the oldest supported interpreter and a current one, on both targets
-        os: [ubuntu-latest, windows-latest]
+        # the oldest supported interpreter and a current one, on both targets.
+        # ubuntu-24.04, not ubuntu-latest: latest moved to 26.04 on 2026-10-19
+        # and setup-python has no 3.9 build for it.
+        os: [ubuntu-24.04, windows-latest]
         python: ["3.9", "3.12"]
 
     steps:
@@ -37,7 +39,7 @@ jobs:
         shell: bash
         run: |
           python - <<'PY'
-          import importlib.util, json
+          import importlib.util, json, sys
           from importlib.machinery import SourceFileLoader
           from pathlib import Path
           from tempfile import TemporaryDirectory
@@ -136,7 +138,21 @@ jobs:
               for name, content in extension_files.items():
                   assert (extension_dir / name).read_bytes() == content
 
+          # Auto-update is opt-in (off unless the config says true), and this
+          # runner has no config: with the gate off nothing may be installed.
           with TemporaryDirectory() as directory:
+              target = Path(directory) / "widget"
+              target.write_text("old = True\n", encoding="utf-8")
+              gated_source = b"APP_VERSION = (1, 0, 0)\nnew = True\n"
+              with patch.object(m, "auto_update_enabled", return_value=False), \
+                      patch.object(m, "urlopen", return_value=Response(gated_source)):
+                  assert not m.install_latest_update(
+                      target, "https://example.test/widget")
+              assert target.read_text(encoding="utf-8") == "old = True\n"
+
+          # The install cases below run with the gate on.
+          with TemporaryDirectory() as directory, \
+                  patch.object(m, "auto_update_enabled", return_value=True):
               target = Path(directory) / "widget"
               target.write_text("old = True\n", encoding="utf-8")
               target.chmod(0o755)
@@ -144,7 +160,8 @@ jobs:
               with patch.object(m, "urlopen", return_value=Response(new_source)):
                   assert m.install_latest_update(target, "https://example.test/widget")
               assert target.read_bytes() == new_source
-              assert target.stat().st_mode & 0o777 == 0o755
+              if sys.platform != "win32":  # Windows keeps no POSIX mode bits
+                  assert target.stat().st_mode & 0o777 == 0o755
               with patch.object(m, "urlopen", return_value=Response(new_source)):
                   assert not m.install_latest_update(target, "https://example.test/widget")
               next_source = b"APP_VERSION = (1, 0, 1)\nnew = True\n"
