@@ -17,11 +17,18 @@ in the GNOME panel or next to the Windows taskbar's notification area.
 
 ## Where the numbers come from
 
-**Quota meters - real, from the server.** The widget runs
-`claude -p "/usage" --output-format json` in the background every five minutes
-and reads the answer. This costs nothing: `/usage` is answered locally by the
+**Quota meters - real, from the server.** Claude Code keeps the server's last
+quota answer in its own config file (`~/.claude.json`, or under
+`CLAUDE_CONFIG_DIR`), and the widget reads it from there - same login only, and
+only while it is under 12 hours old; a window that has reset since is dropped.
+Newer Claude Code versions no longer print percentages from `claude -p /usage`,
+so this is now the main source.
+
+As a second source, the widget runs `claude -p "/usage" --output-format json`
+in the background every five minutes, unless Claude Code fetched the quota
+itself in that time. This costs nothing: `/usage` is answered locally by the
 CLI, so the call reports `num_turns: 0` and `total_cost_usd: 0`. No window
-opens, nothing is sent to a model.
+opens, nothing is sent to a model. The fresher of the two answers wins.
 
 100% means blocked. The tooltip shows when the quota resets and how old the
 reading is.
