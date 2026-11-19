@@ -30,7 +30,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 IS_WINDOWS = os.name == "nt"
-APP_VERSION = (1, 1, 0)
+APP_VERSION = (1, 2, 0)
 
 SCRIPT_PATH = Path(__file__).resolve()
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
