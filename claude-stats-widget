@@ -30,7 +30,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 IS_WINDOWS = os.name == "nt"
-APP_VERSION = (1, 2, 0)
+APP_VERSION = (1, 3, 0)
 
 SCRIPT_PATH = Path(__file__).resolve()
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
@@ -122,6 +122,7 @@ TR = {
         "update_disabled": "עדכון אוטומטי כבוי",
         "auto_update": "עדכון אוטומטי",
         "auto_update_tip": "מוריד ומריץ קוד מהענף הראשי ב-GitHub, ללא חתימה",
+        "reset_ready": "✨ מחכה לך איפוס מכסה - /limit-reset ב-Claude Code",
     },
     "en": {
         "title": "✳ Claude Code - Usage",
@@ -165,6 +166,7 @@ TR = {
         "update_disabled": "Auto-update off",
         "auto_update": "Auto-update",
         "auto_update_tip": "Downloads and runs code from GitHub main, unsigned",
+        "reset_ready": "✨ A limit reset is waiting - /limit-reset in Claude Code",
     },
 }
 
@@ -389,6 +391,22 @@ def tray_icon_grid(frame, hour5_pct):
     return rows
 
 
+RESET_BADGE = "✨"   # in the Basic Plane, so Tk on Windows can draw it too
+
+
+def meter_title(stats, key, text):
+    """Lead the meter row with a sparkle while a limit reset is waiting."""
+    if key == "hour5" and stats.get("reset_available"):
+        return f"{RESET_BADGE} {text}"
+    return text
+
+
+def meter_tip(stats, lang, tip):
+    if stats.get("reset_available"):
+        return f"{tip}\n{TR[lang]['reset_ready']}"
+    return tip
+
+
 def tray_tooltip(stats, lang, config, now_ts=None):
     """Build the truthful quota summary shown by the native tray tooltip."""
     t = TR[lang]
@@ -415,6 +433,8 @@ def tray_tooltip(stats, lang, config, now_ts=None):
                 countdown = fmt_countdown(left, lang) if resets else t["fresh"]
                 value = f"{t['tray_resets_in']} {countdown}"
         lines.append(f"{t[f'{key}_short']}: {value}")
+    if stats.get("reset_available"):
+        lines.append(t["reset_ready"])
     return "\n".join(lines)
 
 
@@ -430,7 +450,7 @@ def panel_state(stats, lang, config, icon_name, now_ts=None):
         "icon": icon_name,
         "hour5_pct": hourly,
         "hour5_text": f"{hourly:.0f}%",
-        "hour5_label": TR[lang]["hour5_short"],
+        "hour5_label": meter_title(stats, "hour5", TR[lang]["hour5_short"]),
         "hour5_is_quota": real_quota,
         "week_pct": weekly,
         "week_text": f"{weekly:.0f}%",
@@ -2157,16 +2177,17 @@ def run_gui_gtk():
                     if key not in meters:
                         continue
                     lab, val, bar = meters[key]
-                    lab.set_text(t[f"{key}_short" if meters is self.mini_meters
-                                   else (f"{key}_quota" if real_quota
-                                         else f"{key}_reset")])
+                    lab.set_text(meter_title(self.stats, key, t[
+                        f"{key}_short" if meters is self.mini_meters
+                        else (f"{key}_quota" if real_quota
+                              else f"{key}_reset")]))
                     val.set_text(text)
                     bar.set_value(max(0.0, min(100.0, elapsed)))
                     ctx = bar.get_style_context()
                     # real quota gets the warning colours; time progress stays
                     # neutral, because a session ending is not a danger
                     (ctx.remove_class if real_quota else ctx.add_class)("recordbar")
-                    bar.set_tooltip_text(tip)
+                    bar.set_tooltip_text(meter_tip(self.stats, self.lang, tip))
             self.publish_panel_state()
             return True
 
@@ -2722,7 +2743,9 @@ def run_gui_tk():
                              "#e8a34c" if pct >= 50 else "#6fbf73")
                     if window.get("quota_pct") is None:
                         color = TK_NEUTRAL
-                    title.configure(text=TR[self.widget.lang][f"{key}_short"])
+                    title.configure(text=meter_title(
+                        self.widget.stats, key,
+                        TR[self.widget.lang][f"{key}_short"]))
                     meter.set(pct, color)
                     value.configure(text=f"{pct:.0f}%")
                 self.tooltip.set(tray_tooltip(
@@ -3238,13 +3261,14 @@ def run_gui_tk():
                     color = TK_NEUTRAL
                 for meters in (self.full_meters, self.mini_meters):
                     lab, val, bar = meters[key]
-                    lab.configure(text=self.tr(
+                    lab.configure(text=meter_title(self.stats, key, self.tr(
                         f"{key}_short" if meters is self.mini_meters
                         else (f"{key}_quota" if real_quota
-                              else f"{key}_reset")))
+                              else f"{key}_reset"))))
                     val.configure(text=text)
                     bar.set(elapsed, color)
-                    bar.tip.set(tip, "right" if self.rtl else "left")
+                    bar.tip.set(meter_tip(self.stats, self.lang, tip),
+                                "right" if self.rtl else "left")
             self.panel_strip.update_data()
 
         def update_heatmap(self):
