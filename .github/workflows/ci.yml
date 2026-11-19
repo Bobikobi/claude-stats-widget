@@ -72,6 +72,35 @@ jobs:
           assert report["session_pct"] == 42, report
           assert report["week_pct"] == 7, report
 
+          # Claude Code's own cached quota (issue #13): used while fresh and
+          # for the same login, a window that already reset is dropped
+          now = 1_800_000_000
+          util = {
+              "five_hour": None,
+              "seven_day": {"utilization": 86.4,
+                            "resets_at": "2027-01-15T12:00:00.031373+00:00"},
+          }
+          cfg = {"oauthAccount": {"accountUuid": "a1"},
+                 "cachedUsageUtilization": {
+                     "fetchedAtMs": (now - 60) * 1000, "accountUuid": "a1",
+                     "utilization": util}}
+          got = m.claude_json_usage(cfg, now_ts=now)
+          assert got["week_pct"] == 86 and "session_pct" not in got, got
+          assert got["week_reset_ts"] > now, got
+          assert m.claude_json_usage(cfg, now_ts=now + 13 * 3600) is None
+          cfg["cachedUsageUtilization"]["accountUuid"] = "someone-else"
+          assert m.claude_json_usage(cfg, now_ts=now) is None
+          cfg["cachedUsageUtilization"]["accountUuid"] = "a1"
+          util["seven_day"]["resets_at"] = "2027-01-15T07:00:00Z"
+          assert m.claude_json_usage(cfg, now_ts=now) is None
+          assert m.claude_json_usage(None) is None
+          with TemporaryDirectory() as directory:
+              with patch.dict("os.environ", {"CLAUDE_CONFIG_DIR": directory}):
+                  assert m.load_claude_json() is None
+                  (Path(directory) / ".claude.json").write_text(
+                      json.dumps(cfg), encoding="utf-8")
+                  assert m.load_claude_json() == cfg
+
           tray_stats = {
               "window_5h": {"quota_pct": 42, "window_seconds": 18_000},
               "window_7d": {"quota_pct": 7, "window_seconds": 604_800},
