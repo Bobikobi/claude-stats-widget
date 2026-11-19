@@ -938,6 +938,11 @@ def poll_usage():
     Verified free: `/usage` is handled client-side, so the call reports
     num_turns 0 and total_cost_usd 0. Runs headless, no window.
     """
+    # Claude Code fetched the quota itself a moment ago: starting a whole
+    # headless session to ask again costs a process and up to 90 seconds.
+    cached = claude_json_usage(load_claude_json())
+    if cached and time.time() - cached["at"] < USAGE_POLL_SECONDS:
+        return cached
     cli = claude_cli()
     if not cli:
         # no CLI, no real quota — the meters fall back cleanly, but say so:
@@ -994,6 +999,122 @@ def load_usage_cache():
     if time.time() - (report.get("at") or 0) > USAGE_MAX_AGE:
         return None
     return report
+
+
+# Claude Code keeps its own copy of the server's quota answer in its config
+# file. Since 2.1.14x `claude -p /usage` no longer prints the percentages
+# (issue #13), so this is now the main source of the real numbers. It refreshes
+# whenever Claude Code runs; while nothing runs, usage cannot grow either.
+CLAUDE_JSON_MAX_AGE = 12 * 3600
+# Claude Code's own trust window for its "a limit reset is waiting" flag.
+RESET_FLAG_MAX_AGE = 3 * 86400
+
+
+def claude_json_path():
+    """Where Claude Code keeps its config, honouring CLAUDE_CONFIG_DIR."""
+    custom = os.environ.get("CLAUDE_CONFIG_DIR")
+    if custom:
+        return Path(custom) / ".claude.json"
+    return Path.home() / ".claude.json"
+
+
+def load_claude_json():
+    try:
+        data = json.loads(claude_json_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _parse_iso(value):
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _same_account(data, block):
+    """A cache written for another login says nothing about this one."""
+    current = (data.get("oauthAccount") or {}).get("accountUuid")
+    cached = block.get("accountUuid")
+    return not (current and cached and current != cached)
+
+
+def claude_json_usage(data, now_ts=None):
+    """The real quota from Claude Code's cachedUsageUtilization, or None."""
+    if not data:
+        return None
+    cached = data.get("cachedUsageUtilization")
+    if not isinstance(cached, dict) or not _same_account(data, cached):
+        return None
+    util = cached.get("utilization")
+    if not isinstance(util, dict):
+        return None
+    now = time.time() if now_ts is None else now_ts
+    try:
+        at = float(cached.get("fetchedAtMs") or 0) / 1000.0
+    except (TypeError, ValueError):
+        return None
+    if not at or now - at > CLAUDE_JSON_MAX_AGE:
+        return None
+    out = {"at": at}
+    for src, prefix in (("five_hour", "session"), ("seven_day", "week")):
+        win = util.get(src)
+        if not isinstance(win, dict):
+            continue    # null: this plan has no such limit
+        try:
+            pct = float(win.get("utilization"))
+        except (TypeError, ValueError):
+            continue
+        ts = _parse_iso(win.get("resets_at"))
+        if ts and ts <= now:
+            continue    # the window reset since then, so the number is stale
+        out[f"{prefix}_pct"] = int(round(pct))
+        out[f"{prefix}_reset_ts"] = ts
+        out[f"{prefix}_reset"] = (
+            datetime.fromtimestamp(ts).strftime("%a %d/%m %H:%M") if ts else "?")
+    return out if ("session_pct" in out or "week_pct" in out) else None
+
+
+def claude_json_reset_available(data, now_ts=None):
+    """True only when Claude Code itself says a limit reset is waiting.
+
+    Claude Code records this in unusedLimitResetStatusCache after asking the
+    server (it is what makes it offer /limit-reset). Trusted on exactly its
+    own terms: same login, checked under three days ago, not past validUntil
+    (the earliest expiry among the resets on hand). Anything less certain
+    reads as no.
+    """
+    if not data:
+        return False
+    flag = data.get("unusedLimitResetStatusCache")
+    if not isinstance(flag, dict) or flag.get("holdsUnusedReset") is not True:
+        return False
+    current = (data.get("oauthAccount") or {}).get("accountUuid")
+    if not current or flag.get("accountUuid") != current:
+        return False
+    now_ms = (time.time() if now_ts is None else now_ts) * 1000
+    try:
+        checked = float(flag.get("checkedAt"))
+        valid_until = float(flag.get("validUntil"))
+    except (TypeError, ValueError):
+        return False
+    return checked <= now_ms and now_ms - checked < RESET_FLAG_MAX_AGE * 1000 \
+        and now_ms < valid_until
+
+
+def best_usage_report(data, now_ts=None):
+    """The fresher of our own /usage poll and Claude Code's cached answer."""
+    polled, cached = load_usage_cache(), claude_json_usage(data, now_ts)
+    if not (polled and cached):
+        return polled or cached
+    if (cached.get("at") or 0) >= (polled.get("at") or 0):
+        return cached
+    # /usage prints its reset times as loose text; borrow the exact ones
+    return dict(polled, **{k: v for k, v in cached.items()
+                           if k.endswith("_reset_ts")})
 
 
 def week_start(today):
@@ -1185,15 +1306,18 @@ def collect_stats():
     fav_model = model_counter.most_common(1)[0][0] if model_counter else None
 
     now_ts = datetime.now().astimezone().timestamp()
-    report = load_usage_cache()
+    claude_json = load_claude_json()
+    report = best_usage_report(claude_json, now_ts)
     windows = {}
     for key, seconds in (("5h", 5 * 3600), ("7d", 7 * 86400)):
         windows[key] = {
             "window_seconds": seconds,
-            # fallback only: when the real quota is unavailable, show how far
-            # the current window has run
-            "resets_at": block_reset(timeline, seconds, now_ts),
-            # the real thing, straight from the server via `/usage`
+            # the server's own reset time when we have it; otherwise guess
+            # from when the current window opened
+            "resets_at": ((report or {}).get(
+                "session_reset_ts" if key == "5h" else "week_reset_ts")
+                or block_reset(timeline, seconds, now_ts)),
+            # the real thing, from the server via Claude Code or `/usage`
             "quota_pct": (report or {}).get(
                 "session_pct" if key == "5h" else "week_pct"),
             "quota_reset": (report or {}).get(
@@ -1218,6 +1342,7 @@ def collect_stats():
         "day_activity": {d.isoformat(): c for d, c in day_activity.items()},
         "session_quota_pct": windows["5h"]["quota_pct"],
         "week_quota_pct": windows["7d"]["quota_pct"],
+        "reset_available": claude_json_reset_available(claude_json, now_ts),
     }
 
 
@@ -2552,6 +2677,10 @@ def run_gui_tk():
                 self.bind_actions(child)
 
         def position(self):
+            # a maximized window can still slide over a topmost strip, so
+            # claim the top again on every pass (issue #13)
+            self.window.attributes("-topmost", True)
+            self.window.lift()
             user32 = self.user32
             taskbar = user32.FindWindowW("Shell_TrayWnd", None)
             rect = self.wintypes.RECT()
