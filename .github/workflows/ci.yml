@@ -101,6 +101,28 @@ jobs:
                       json.dumps(cfg), encoding="utf-8")
                   assert m.load_claude_json() == cfg
 
+          # the reset sparkle trusts Claude Code's flag on its own terms only
+          flag = {"accountUuid": "a1", "holdsUnusedReset": True,
+                  "checkedAt": (now - 3600) * 1000,
+                  "validUntil": (now + 3600) * 1000}
+          cfg["unusedLimitResetStatusCache"] = flag
+          assert m.claude_json_reset_available(cfg, now_ts=now)
+          assert not m.claude_json_reset_available(cfg, now_ts=now + 7200)
+          assert not m.claude_json_reset_available(
+              cfg, now_ts=now - 7200)   # checked "in the future"
+          flag["validUntil"] = (now + 5 * 86400) * 1000
+          assert not m.claude_json_reset_available(
+              cfg, now_ts=now + 3 * 86400)   # older than three days
+          flag["accountUuid"] = "someone-else"
+          assert not m.claude_json_reset_available(cfg, now_ts=now)
+          flag["accountUuid"] = "a1"
+          flag["holdsUnusedReset"] = False
+          assert not m.claude_json_reset_available(cfg, now_ts=now)
+          assert not m.claude_json_reset_available(None)
+          assert m.meter_title({"reset_available": True}, "hour5", "5h") == "\u2728 5h"
+          assert m.meter_title({"reset_available": True}, "week", "7d") == "7d"
+          assert m.meter_title({}, "hour5", "5h") == "5h"
+
           tray_stats = {
               "window_5h": {"quota_pct": 42, "window_seconds": 18_000},
               "window_7d": {"quota_pct": 7, "window_seconds": 604_800},
@@ -117,6 +139,14 @@ jobs:
           assert panel["week_pct"] == 7
           assert panel["show_hour5"] and panel["show_week"]
           assert panel["icon"] == "clawd-1.png"
+          assert panel["hour5_label"] == "5h"
+          tray_stats["reset_available"] = True
+          panel = m.panel_state(
+              tray_stats, "en", {}, "clawd-1.png", now_ts=0)
+          assert panel["hour5_label"] == "\u2728 5h", panel
+          assert panel["week_label"] == "7d", panel
+          assert panel["tooltip"].endswith("/limit-reset in Claude Code"), panel
+          del tray_stats["reset_available"]
           tray_stats["window_5h"] = {
               "quota_pct": None, "resets_at": 9_000, "window_seconds": 18_000}
           tray_stats["window_7d"] = {

@@ -33,6 +33,14 @@ opens, nothing is sent to a model. The fresher of the two answers wins.
 100% means blocked. The tooltip shows when the quota resets and how old the
 reading is.
 
+**✨ A limit reset is waiting.** When Claude Code has a limit reset on hand for
+you (the one `/limit-reset` uses), the session meter's label starts with ✨, in
+the window, the GNOME panel and the Windows taskbar strip, and the tooltip says
+how to use it. The widget only repeats what Claude Code itself recorded after
+asking the server, on Claude Code's own terms: same login, checked within the
+last three days, and not past the reset's expiry. Anything less certain shows
+nothing.
+
 If the `claude` CLI is not on `PATH`, or the call fails, the meters fall back to
 showing how far the current usage window has run - clearly labelled as time
 progress, not quota, so it never pretends to know something it does not.
