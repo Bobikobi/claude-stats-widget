@@ -1,19 +1,26 @@
 # Claude Stats Widget
 
-**A desktop widget for Linux (GNOME) and Windows that shows your real Claude Code session and weekly quota, an activity heatmap, and Clawd in pixel art.**
+**See how much of your Claude Code session and weekly quota is left, without typing `/usage`.**
 
-Built by [Elad Saadon](https://www.eladsaadon.dev) - [see more projects](https://www.eladsaadon.dev/projects). Installed with one command (see [Install](#install)); MIT licensed.
+A desktop widget for Linux (GNOME) and Windows: real quota meters read from
+Claude Code itself, a contribution-style heatmap of your activity, a warning at
+80% and 95%, and Clawd wandering around in pixel art.
 
-A small desktop widget that shows your Claude Code usage: how much of your
-session and weekly quota is gone, how much you have written, and a
-contribution-style heatmap of your activity - with Clawd, the Claude Code
-mascot, wandering around at the bottom.
+![The widget: session and weekly quota meters, activity heatmap, Clawd walking](docs/demo.gif)
 
-Runs on **Linux** (GTK3 plus a GNOME Shell extension) and **Windows**
-(Tkinter). A wide, animated Clawd-and-usage strip sits just left of the clock
-in the GNOME panel or next to the Windows taskbar's notification area.
+```sh
+curl -fsSL https://raw.githubusercontent.com/Bobikobi/claude-stats-widget/main/install.sh | bash   # Linux
+```
 
-![The widget window: session and weekly quota, activity heatmap, Clawd](docs/screenshot.png)
+```powershell
+irm https://raw.githubusercontent.com/Bobikobi/claude-stats-widget/main/install.ps1 | iex          # Windows
+```
+
+No account, no root, nothing uploaded, costs no tokens. MIT licensed.
+Details and uninstall in [Install](#install).
+
+On Linux a wide Clawd-and-meters strip also sits just left of the clock in the
+GNOME panel; on Windows it sits next to the taskbar's notification area.
 
 ## Where the numbers come from
 
@@ -259,6 +266,9 @@ extension, or not at all while it sits there showing you yesterday's numbers.
 ## License
 
 MIT - see [LICENSE](LICENSE).
+
+Built by [Elad Saadon](https://www.eladsaadon.dev) - [more projects](https://www.eladsaadon.dev/projects).
+If the widget saves you a `/usage` a day, a star helps other Claude Code users find it.
 
 Clawd is Anthropic's mascot; the pixel rendition here is a fan tribute and this
 project is not affiliated with or endorsed by Anthropic.
